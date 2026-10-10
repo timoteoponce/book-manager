@@ -25,6 +25,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -39,8 +40,13 @@ var supportedFormats = map[string]bool{
 }
 
 type App struct {
-	db        *sql.DB
-	bookshelf string
+	db          *sql.DB
+	bookshelf   string
+	syncMu      sync.Mutex
+	stateMu     sync.RWMutex
+	syncing     bool
+	lastSync    SyncResult
+	lastSyncErr string
 }
 
 type Book struct {
@@ -142,10 +148,6 @@ func main() {
 	if err := app.initDB(context.Background()); err != nil {
 		log.Fatal(err)
 	}
-	if _, err := app.sync(context.Background()); err != nil {
-		log.Printf("initial sync failed: %v", err)
-	}
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", app.index)
 	mux.HandleFunc("/api/books", app.books)
@@ -155,6 +157,7 @@ func main() {
 	mux.HandleFunc("/api/organize/apply", app.organizationApply)
 	mux.HandleFunc("/api/organize/undo", app.organizationUndo)
 	mux.HandleFunc("/api/sync", app.syncHandler)
+	mux.HandleFunc("/api/sync/status", app.syncStatus)
 	mux.HandleFunc("/api/open/", app.open)
 	mux.HandleFunc("/api/preview/", app.preview)
 	mux.HandleFunc("/api/cover/", app.cover)
@@ -170,6 +173,12 @@ func main() {
 			log.Printf("could not open browser: %v", err)
 		}
 	}
+	app.setSyncing(true)
+	go func() {
+		if _, err := app.syncInBackground(context.Background()); err != nil {
+			log.Printf("initial sync failed: %v", err)
+		}
+	}()
 	log.Fatal(http.Serve(listener, mux))
 }
 
@@ -228,6 +237,23 @@ func (a *App) initDB(ctx context.Context) error {
 }
 
 func (a *App) sync(ctx context.Context) (SyncResult, error) {
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+	a.setSyncing(true)
+	result, err := a.syncUnlocked(ctx)
+	a.finishSync(result, err)
+	return result, err
+}
+
+func (a *App) syncInBackground(ctx context.Context) (SyncResult, error) {
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+	result, err := a.syncUnlocked(ctx)
+	a.finishSync(result, err)
+	return result, err
+}
+
+func (a *App) syncUnlocked(ctx context.Context) (SyncResult, error) {
 	type foundBook struct {
 		path, folder, filename, title, author, format, modified, fingerprint string
 		size                                                                 int64
@@ -332,6 +358,41 @@ func (a *App) sync(ctx context.Context) (SyncResult, error) {
 	return result, nil
 }
 
+func (a *App) setSyncing(running bool) {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	a.syncing = running
+	if running {
+		a.lastSyncErr = ""
+	}
+}
+
+func (a *App) finishSync(result SyncResult, err error) {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	a.syncing = false
+	a.lastSync = result
+	a.lastSyncErr = ""
+	if err != nil {
+		a.lastSyncErr = err.Error()
+	}
+}
+
+func (a *App) syncStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	a.stateMu.RLock()
+	response := map[string]any{
+		"syncing": a.syncing,
+		"result":  a.lastSync,
+		"error":   a.lastSyncErr,
+	}
+	a.stateMu.RUnlock()
+	writeJSON(w, response)
+}
+
 func (a *App) books(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
@@ -385,12 +446,22 @@ func (a *App) syncHandler(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	result, err := a.sync(r.Context())
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	a.stateMu.Lock()
+	if a.syncing {
+		a.stateMu.Unlock()
+		http.Error(w, "sync already in progress", http.StatusConflict)
 		return
 	}
-	writeJSON(w, result)
+	a.syncing = true
+	a.lastSyncErr = ""
+	a.stateMu.Unlock()
+	go func() {
+		if _, err := a.syncInBackground(context.Background()); err != nil {
+			log.Printf("sync failed: %v", err)
+		}
+	}()
+	w.WriteHeader(http.StatusAccepted)
+	writeJSON(w, map[string]bool{"started": true})
 }
 
 func (a *App) book(w http.ResponseWriter, r *http.Request) {
