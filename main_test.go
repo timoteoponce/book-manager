@@ -70,6 +70,40 @@ func TestSyncPreservesMetadataAcrossRenameAndRemoval(t *testing.T) {
 	}
 }
 
+func TestSyncReusesUnchangedFileCache(t *testing.T) {
+	bookshelf := t.TempDir()
+	filePath := filepath.Join(bookshelf, "Author - Cached Book.pdf")
+	if err := os.WriteFile(filePath, []byte("cached"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:cache-test?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	app := &App{db: db, bookshelf: bookshelf}
+	if err := app.initDB(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE books SET title = 'Cached Metadata', author = 'Cached Author', fingerprint = 'cached:fingerprint'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var title, author, fingerprint string
+	if err := db.QueryRow(`SELECT title, author, fingerprint FROM books`).Scan(&title, &author, &fingerprint); err != nil {
+		t.Fatal(err)
+	}
+	if title != "Cached Metadata" || author != "Cached Author" || fingerprint != "cached:fingerprint" {
+		t.Fatalf("cached metadata = %q, %q, %q", title, author, fingerprint)
+	}
+}
+
 func TestEPUBCoverSupportsEPUB2Metadata(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "cover.epub")
 	file, err := os.Create(path)

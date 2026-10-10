@@ -223,33 +223,42 @@ func (a *App) sync(ctx context.Context) (SyncResult, error) {
 		if err != nil {
 			return err
 		}
-		fingerprint, err := fileFingerprint(path)
-		if err != nil {
-			return err
-		}
 		rel, err := filepath.Rel(a.bookshelf, path)
 		if err != nil {
 			return err
 		}
+		modified := info.ModTime().UTC().Format(time.RFC3339Nano)
+		var cachedTitle, cachedAuthor, cachedFingerprint, cachedModified string
+		var cachedSize int64
+		cacheErr := a.db.QueryRowContext(ctx, `SELECT title, author, fingerprint, size, modified_at FROM books WHERE path = ?`, filepath.ToSlash(rel)).Scan(&cachedTitle, &cachedAuthor, &cachedFingerprint, &cachedSize, &cachedModified)
 		title, author := displayMetadata(entry.Name())
-		if ext == ".epub" {
-			if epubTitle, epubAuthor := epubMetadata(path); epubTitle != "" {
-				title, author = epubTitle, epubAuthor
+		fingerprint := ""
+		if cacheErr == nil && cachedFingerprint != "" && cachedSize == info.Size() && cachedModified == modified {
+			title, author, fingerprint = cachedTitle, cachedAuthor, cachedFingerprint
+		} else {
+			fingerprint, err = fileFingerprint(path)
+			if err != nil {
+				return err
 			}
-		} else if ext == ".pdf" {
-			if pdfTitle, pdfAuthor := pdfMetadata(path); pdfTitle != "" || pdfAuthor != "" {
-				if pdfTitle != "" {
-					title = pdfTitle
+			if ext == ".epub" {
+				if epubTitle, epubAuthor := epubMetadata(path); epubTitle != "" {
+					title, author = epubTitle, epubAuthor
 				}
-				if pdfAuthor != "" {
-					author = pdfAuthor
+			} else if ext == ".pdf" {
+				if pdfTitle, pdfAuthor := pdfMetadata(path); pdfTitle != "" || pdfAuthor != "" {
+					if pdfTitle != "" {
+						title = pdfTitle
+					}
+					if pdfAuthor != "" {
+						author = pdfAuthor
+					}
 				}
 			}
 		}
 		found = append(found, foundBook{
 			path: filepath.ToSlash(rel), folder: filepath.ToSlash(filepath.Dir(rel)),
 			filename: entry.Name(), title: title, author: author, format: strings.TrimPrefix(ext, "."),
-			size: info.Size(), modified: info.ModTime().UTC().Format(time.RFC3339Nano), fingerprint: fingerprint,
+			size: info.Size(), modified: modified, fingerprint: fingerprint,
 		})
 		return nil
 	})
