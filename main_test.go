@@ -130,7 +130,7 @@ func TestOrganizationTargetIsHumanReadableAndSafe(t *testing.T) {
 		Author:   "Jane/Doe",
 		Format:   "pdf",
 	})
-	if target != "Software Development/Jane_Doe/A _Practical_ Book.pdf" {
+	if target != "Jane_Doe/A _Practical_ Book/A _Practical_ Book.pdf" {
 		t.Fatalf("organization target = %q", target)
 	}
 	if sanitizePathPart("CON") != "_CON" {

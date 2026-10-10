@@ -602,11 +602,6 @@ func displayMetadata(filename string) (string, string) {
 }
 
 func organizationTarget(book Book) string {
-	category := "Bookshelf"
-	folder := filepath.ToSlash(book.Folder)
-	if folder != "." && folder != "" {
-		category = strings.Split(folder, "/")[0]
-	}
 	author := book.Author
 	if author == "" {
 		author = "Unknown Author"
@@ -619,7 +614,9 @@ func organizationTarget(book Book) string {
 	if ext == "" && book.Format != "" {
 		ext = "." + strings.ToLower(book.Format)
 	}
-	return filepath.ToSlash(filepath.Join(sanitizePathPart(category), sanitizePathPart(author), sanitizePathPart(title)+ext))
+	cleanAuthor := sanitizePathPart(author)
+	cleanTitle := sanitizePathPart(title)
+	return filepath.ToSlash(filepath.Join(cleanAuthor, cleanTitle, cleanTitle+ext))
 }
 
 func sanitizePathPart(value string) string {
