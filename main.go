@@ -20,6 +20,7 @@ import (
 	"os/exec"
 	pathpkg "path"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"sort"
 	"strings"
@@ -212,6 +213,15 @@ func (a *App) sync(ctx context.Context) (SyncResult, error) {
 			if epubTitle, epubAuthor := epubMetadata(path); epubTitle != "" {
 				title, author = epubTitle, epubAuthor
 			}
+		} else if ext == ".pdf" {
+			if pdfTitle, pdfAuthor := pdfMetadata(path); pdfTitle != "" || pdfAuthor != "" {
+				if pdfTitle != "" {
+					title = pdfTitle
+				}
+				if pdfAuthor != "" {
+					author = pdfAuthor
+				}
+			}
 		}
 		found = append(found, foundBook{
 			path: filepath.ToSlash(rel), folder: filepath.ToSlash(filepath.Dir(rel)),
@@ -268,6 +278,7 @@ func (a *App) sync(ctx context.Context) (SyncResult, error) {
 func (a *App) books(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+	status := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
 	query := `SELECT id, path, folder, filename, title, author, format, size, modified_at, status, tags, notes, last_synced_at, available FROM books`
 	args := []any{}
 	conditions := []string{}
@@ -279,6 +290,14 @@ func (a *App) books(w http.ResponseWriter, r *http.Request) {
 	if format != "" {
 		conditions = append(conditions, `format = ?`)
 		args = append(args, format)
+	}
+	if status != "" {
+		if status == "__none__" {
+			conditions = append(conditions, `status = ''`)
+		} else {
+			conditions = append(conditions, `status = ?`)
+			args = append(args, status)
+		}
 	}
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ")
@@ -537,6 +556,36 @@ func displayMetadata(filename string) (string, string) {
 		return strings.TrimSpace(parts[1]), strings.TrimSpace(parts[0])
 	}
 	return base, ""
+}
+
+var pdfInfoString = regexp.MustCompile(`/((?:Title)|(?:Author))\s*\(([^()]*)\)`)
+
+func pdfMetadata(path string) (string, string) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", ""
+	}
+	var title, author string
+	for _, match := range pdfInfoString.FindAllStringSubmatch(string(data), -1) {
+		value := decodePDFString(match[2])
+		switch match[1] {
+		case "Title":
+			title = value
+		case "Author":
+			author = value
+		}
+	}
+	return title, author
+}
+
+func decodePDFString(value string) string {
+	value = strings.ReplaceAll(value, `\n`, "\n")
+	value = strings.ReplaceAll(value, `\r`, "\r")
+	value = strings.ReplaceAll(value, `\t`, "\t")
+	value = strings.ReplaceAll(value, `\(`, "(")
+	value = strings.ReplaceAll(value, `\)`, ")")
+	value = strings.ReplaceAll(value, `\\`, `\`)
+	return strings.TrimSpace(value)
 }
 
 func epubMetadata(path string) (string, string) {

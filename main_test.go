@@ -110,3 +110,14 @@ func TestEPUBCoverSupportsEPUB2Metadata(t *testing.T) {
 		t.Fatalf("cover = %q (%s)", data, mediaType)
 	}
 }
+
+func TestPDFMetadataReadsInfoDictionary(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "book.pdf")
+	if err := os.WriteFile(path, []byte("7 0 obj << /Title (A PDF Title) /Author (Jane Doe) >> endobj"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	title, author := pdfMetadata(path)
+	if title != "A PDF Title" || author != "Jane Doe" {
+		t.Fatalf("metadata = %q, %q", title, author)
+	}
+}

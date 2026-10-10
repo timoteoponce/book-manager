@@ -20,20 +20,20 @@
 <body>
   <header><h1>Bookshelf</h1><p>A local catalogue of your existing files. Nothing is moved or renamed during sync.</p></header>
   <main>
-    <div class="toolbar"><input id="search" type="search" placeholder="Search title, author, folder, or filename" autofocus><select id="format"><option value="">All formats</option><option>epub</option><option>pdf</option><option>cbz</option><option>mobi</option><option>azw3</option><option>fb2</option><option>txt</option></select><button id="sync" class="primary">Sync bookshelf</button><a href="/api/export"><button type="button">Export metadata</button></a></div>
+    <div class="toolbar"><input id="search" type="search" placeholder="Search title, author, folder, or filename" autofocus><select id="format"><option value="">All formats</option><option>epub</option><option>pdf</option><option>cbz</option><option>mobi</option><option>azw3</option><option>fb2</option><option>txt</option></select><select id="status"><option value="">All reading states</option><option value="unread">Unread</option><option value="reading">Reading</option><option value="finished">Finished</option><option value="paused">Paused</option><option value="__none__">Not set</option></select><button id="sync" class="primary">Sync bookshelf</button><a href="/api/export"><button type="button">Export metadata</button></a></div>
     <div id="summary">Loading catalogue...</div><section id="books" class="grid"></section>
   </main>
   <dialog id="detail-dialog"><div id="detail-content" class="detail"></div></dialog>
   <script>
-    const search = document.querySelector('#search'), format = document.querySelector('#format'), books = document.querySelector('#books'), summary = document.querySelector('#summary'), sync = document.querySelector('#sync');
+    const search = document.querySelector('#search'), format = document.querySelector('#format'), status = document.querySelector('#status'), books = document.querySelector('#books'), summary = document.querySelector('#summary'), sync = document.querySelector('#sync');
     const esc = value => String(value ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;',"'":'&#39;','"':'&quot;'}[c]));
     const size = bytes => bytes < 1048576 ? `${Math.round(bytes / 1024)} KB` : `${(bytes / 1048576).toFixed(1)} MB`;
     async function load() {
-      const params = new URLSearchParams({q: search.value, format: format.value});
+      const params = new URLSearchParams({q: search.value, format: format.value, status: status.value});
       const response = await fetch('/api/books?' + params); const data = await response.json();
       const unavailable = data.books.filter(book => !book.available).length;
       summary.textContent = `${data.count} ${data.count === 1 ? 'book' : 'books'} indexed${unavailable ? `, ${unavailable} unavailable` : ''}`;
-      books.innerHTML = data.books.length ? data.books.map(book => `<article class="${book.available ? '' : 'unavailable'}">${book.available && book.format === 'epub' ? `<img class="cover" src="/api/cover/${book.id}" loading="lazy" alt="" onerror="this.remove()">` : ''}<h2>${esc(book.title)}</h2>${book.author ? `<p>by ${esc(book.author)}</p>` : ''}<p class="folder">${esc(book.folder === '.' ? 'Bookshelf root' : book.folder)}</p><div class="meta"><span class="badge">${esc(book.format)}</span><span class="badge">${size(book.size)}</span>${book.available ? '' : '<span class="badge">Unavailable</span>'}</div><div class="actions"><small title="${esc(book.path)}">${esc(book.filename)}</small><button onclick="showBook(${book.id})">Details</button></div></article>`).join('') : '<div class="empty">No books match this search.</div>';
+      books.innerHTML = data.books.length ? data.books.map(book => `<article class="${book.available ? '' : 'unavailable'}">${book.available && book.format === 'epub' ? `<img class="cover" src="/api/cover/${book.id}" loading="lazy" alt="" onerror="this.remove()">` : ''}<h2>${esc(book.title)}</h2>${book.author ? `<p>by ${esc(book.author)}</p>` : ''}<p class="folder">${esc(book.folder === '.' ? 'Bookshelf root' : book.folder)}</p><div class="meta"><span class="badge">${esc(book.format)}</span><span class="badge">${size(book.size)}</span>${book.status ? `<span class="badge">${esc(book.status)}</span>` : ''}${book.available ? '' : '<span class="badge">Unavailable</span>'}</div><div class="actions"><small title="${esc(book.path)}">${esc(book.filename)}</small><button onclick="showBook(${book.id})">Details</button></div></article>`).join('') : '<div class="empty">No books match this search.</div>';
     }
     async function openBook(id) { const response = await fetch('/api/open/' + id, {method: 'POST'}); if (!response.ok) alert(await response.text()); }
     async function showBook(id) {
@@ -44,7 +44,7 @@
       document.querySelector('#book-status').value = book.status; dialog.showModal();
     }
     async function saveBook(id) { const body = {status: document.querySelector('#book-status').value, tags: document.querySelector('#book-tags').value, notes: document.querySelector('#book-notes').value}; const response = await fetch('/api/book/' + id, {method: 'PATCH', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(body)}); if (!response.ok) { alert(await response.text()); return; } document.querySelector('#detail-dialog').close(); await load(); }
-    let timer; search.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(load, 150); }); format.addEventListener('change', load);
+    let timer; search.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(load, 150); }); format.addEventListener('change', load); status.addEventListener('change', load);
     sync.addEventListener('click', async () => { sync.disabled = true; sync.textContent = 'Syncing...'; try { const response = await fetch('/api/sync', {method: 'POST'}); if (!response.ok) throw new Error(await response.text()); const result = await response.json(); summary.textContent = `Sync complete: ${result.indexed} indexed${result.renamed ? `, ${result.renamed} renamed` : ''}${result.unavailable ? `, ${result.unavailable} unavailable` : ''}`; await load(); } catch (error) { summary.textContent = `Sync failed: ${error.message}`; } finally { sync.disabled = false; sync.textContent = 'Sync bookshelf'; } });
     load();
   </script>
