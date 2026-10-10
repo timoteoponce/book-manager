@@ -1,8 +1,10 @@
 package main
 
 import (
+	"archive/zip"
 	"context"
 	"database/sql"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -64,5 +66,47 @@ func TestSyncPreservesMetadataAcrossRenameAndRemoval(t *testing.T) {
 	}
 	if available != 0 {
 		t.Fatalf("removed book availability = %d", available)
+	}
+}
+
+func TestEPUBCoverSupportsEPUB2Metadata(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "cover.epub")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := zip.NewWriter(file)
+	entries := map[string]string{
+		"META-INF/container.xml": `<?xml version="1.0"?><container><rootfiles><rootfile full-path="OEBPS/content.opf"/></rootfiles></container>`,
+		"OEBPS/content.opf":      `<package><metadata><meta name="cover" content="cover-image"/></metadata><manifest><item id="cover-image" href="images/cover.jpg" media-type="image/jpeg"/></manifest></package>`,
+		"OEBPS/images/cover.jpg": "cover bytes",
+	}
+	for name, content := range entries {
+		writer, err := archive.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	cover, mediaType, err := epubCover(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cover.Close()
+	data, err := io.ReadAll(cover)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "cover bytes" || mediaType != "image/jpeg" {
+		t.Fatalf("cover = %q (%s)", data, mediaType)
 	}
 }

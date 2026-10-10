@@ -15,8 +15,10 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
+	pathpkg "path"
 	"path/filepath"
 	"runtime"
 	"sort"
@@ -70,9 +72,25 @@ type epubContainer struct {
 
 type opfPackage struct {
 	Metadata struct {
-		Title   string `xml:"title"`
-		Creator string `xml:"creator"`
+		Title   string     `xml:"title"`
+		Creator string     `xml:"creator"`
+		Items   []epubMeta `xml:"meta"`
 	} `xml:"metadata"`
+	Manifest struct {
+		Items []epubManifestItem `xml:"item"`
+	} `xml:"manifest"`
+}
+
+type epubManifestItem struct {
+	ID         string `xml:"id,attr"`
+	Href       string `xml:"href,attr"`
+	MediaType  string `xml:"media-type,attr"`
+	Properties string `xml:"properties,attr"`
+}
+
+type epubMeta struct {
+	Name    string `xml:"name,attr"`
+	Content string `xml:"content,attr"`
 }
 
 func main() {
@@ -108,6 +126,7 @@ func main() {
 	mux.HandleFunc("/api/sync", app.syncHandler)
 	mux.HandleFunc("/api/open/", app.open)
 	mux.HandleFunc("/api/preview/", app.preview)
+	mux.HandleFunc("/api/cover/", app.cover)
 	log.Printf("book manager: %s", app.bookshelf)
 	log.Printf("open http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
@@ -411,6 +430,38 @@ func (a *App) preview(w http.ResponseWriter, r *http.Request) {
 	http.ServeFile(w, r, path)
 }
 
+func (a *App) cover(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := bookID(r.URL.Path, "/api/cover/")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var relative, format string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT path, format FROM books WHERE id = ? AND available = 1`, id).Scan(&relative, &format); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if format != "epub" {
+		http.NotFound(w, r)
+		return
+	}
+	cover, mediaType, err := epubCover(filepath.Join(a.bookshelf, filepath.FromSlash(relative)))
+	if err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	defer cover.Close()
+	w.Header().Set("Content-Type", mediaType)
+	w.Header().Set("Cache-Control", "private, max-age=3600")
+	if _, err := io.Copy(w, cover); err != nil {
+		log.Printf("cover response failed: %v", err)
+	}
+}
+
 func (a *App) open(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -494,6 +545,14 @@ func epubMetadata(path string) (string, string) {
 		return "", ""
 	}
 	defer z.Close()
+	pkg, _, err := epubPackage(z)
+	if err != nil {
+		return "", ""
+	}
+	return strings.TrimSpace(pkg.Metadata.Title), strings.TrimSpace(pkg.Metadata.Creator)
+}
+
+func epubPackage(z *zip.ReadCloser) (*opfPackage, string, error) {
 	var container epubContainer
 	for _, file := range z.File {
 		if file.Name != "META-INF/container.xml" {
@@ -501,32 +560,118 @@ func epubMetadata(path string) (string, string) {
 		}
 		reader, err := file.Open()
 		if err != nil {
-			return "", ""
+			return nil, "", err
 		}
 		err = xml.NewDecoder(reader).Decode(&container)
 		_ = reader.Close()
 		if err != nil || len(container.Rootfiles) == 0 {
-			return "", ""
+			return nil, "", errors.New("invalid epub container")
 		}
 		break
 	}
+	if len(container.Rootfiles) == 0 {
+		return nil, "", errors.New("epub package not found")
+	}
+	rootfile := filepath.ToSlash(container.Rootfiles[0].FullPath)
 	for _, file := range z.File {
-		if filepath.ToSlash(file.Name) != filepath.ToSlash(container.Rootfiles[0].FullPath) {
+		if filepath.ToSlash(file.Name) != rootfile {
 			continue
 		}
 		reader, err := file.Open()
 		if err != nil {
-			return "", ""
+			return nil, "", err
 		}
 		var pkg opfPackage
 		err = xml.NewDecoder(reader).Decode(&pkg)
 		_ = reader.Close()
 		if err != nil {
-			return "", ""
+			return nil, "", err
 		}
-		return strings.TrimSpace(pkg.Metadata.Title), strings.TrimSpace(pkg.Metadata.Creator)
+		return &pkg, rootfile, nil
 	}
-	return "", ""
+	return nil, "", errors.New("opf package not found")
+}
+
+func epubCover(path string) (io.ReadCloser, string, error) {
+	z, err := zip.OpenReader(path)
+	if err != nil {
+		return nil, "", err
+	}
+	pkg, opfPath, err := epubPackage(z)
+	if err != nil {
+		_ = z.Close()
+		return nil, "", err
+	}
+	coverID := ""
+	for _, item := range pkg.Metadata.Items {
+		if strings.EqualFold(item.Name, "cover") {
+			coverID = item.Content
+			break
+		}
+	}
+	var selected *epubManifestItem
+	for i := range pkg.Manifest.Items {
+		item := &pkg.Manifest.Items[i]
+		if (coverID != "" && item.ID == coverID) || hasWord(item.Properties, "cover-image") {
+			selected = item
+			break
+		}
+	}
+	if selected == nil {
+		for i := range pkg.Manifest.Items {
+			item := &pkg.Manifest.Items[i]
+			candidate := strings.ToLower(item.ID + " " + item.Href)
+			if strings.HasPrefix(item.MediaType, "image/") && strings.Contains(candidate, "cover") {
+				selected = item
+				break
+			}
+		}
+	}
+	if selected == nil {
+		_ = z.Close()
+		return nil, "", errors.New("cover image not found")
+	}
+	href, err := url.PathUnescape(selected.Href)
+	if err != nil {
+		_ = z.Close()
+		return nil, "", err
+	}
+	coverPath := pathpkg.Clean(pathpkg.Join(pathpkg.Dir(opfPath), href))
+	for _, file := range z.File {
+		if pathpkg.Clean(file.Name) == coverPath {
+			reader, err := file.Open()
+			if err != nil {
+				_ = z.Close()
+				return nil, "", err
+			}
+			return &zipCoverReader{ReadCloser: reader, archive: z}, selected.MediaType, nil
+		}
+	}
+	_ = z.Close()
+	return nil, "", errors.New("cover file not found")
+}
+
+func hasWord(value, wanted string) bool {
+	for _, word := range strings.Fields(value) {
+		if word == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+type zipCoverReader struct {
+	io.ReadCloser
+	archive *zip.ReadCloser
+}
+
+func (r *zipCoverReader) Close() error {
+	readerErr := r.ReadCloser.Close()
+	archiveErr := r.archive.Close()
+	if readerErr != nil {
+		return readerErr
+	}
+	return archiveErr
 }
 
 func openWithOS(path string) error {
