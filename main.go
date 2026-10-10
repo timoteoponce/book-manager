@@ -14,6 +14,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -107,12 +108,26 @@ type epubMeta struct {
 }
 
 func main() {
-	defaultBookshelf := filepath.Join(mustUserHome(), "bookshelf")
-	defaultDB := filepath.Join(mustConfigDir(), "book-manager", "catalog.sqlite")
-	bookshelf := flag.String("bookshelf", defaultBookshelf, "folder to catalogue")
-	dbPath := flag.String("db", defaultDB, "SQLite catalogue path")
-	addr := flag.String("addr", "127.0.0.1:8765", "HTTP listen address")
+	executableDir := mustExecutableDir()
+	bookshelf := flag.String("bookshelf", "", "folder to catalogue (defaults to the executable directory when packaged)")
+	dbPath := flag.String("db", "", "SQLite catalogue path (defaults beside the executable when packaged)")
+	addr := flag.String("addr", "127.0.0.1:0", "HTTP listen address; port 0 selects an available port")
+	noBrowser := flag.Bool("no-browser", false, "do not open the application in the default browser")
 	flag.Parse()
+	if *bookshelf == "" {
+		if isDevelopmentExecutable(executableDir) {
+			*bookshelf = filepath.Join(mustUserHome(), "bookshelf")
+		} else {
+			*bookshelf = executableDir
+		}
+	}
+	if *dbPath == "" {
+		if isDevelopmentExecutable(executableDir) {
+			*dbPath = filepath.Join(mustConfigDir(), "book-manager", "catalog.sqlite")
+		} else {
+			*dbPath = filepath.Join(executableDir, ".book-manager", "catalog.sqlite")
+		}
+	}
 
 	if err := os.MkdirAll(filepath.Dir(*dbPath), 0o755); err != nil {
 		log.Fatal(err)
@@ -144,8 +159,18 @@ func main() {
 	mux.HandleFunc("/api/preview/", app.preview)
 	mux.HandleFunc("/api/cover/", app.cover)
 	log.Printf("book manager: %s", app.bookshelf)
-	log.Printf("open http://%s", *addr)
-	log.Fatal(http.ListenAndServe(*addr, mux))
+	listener, err := net.Listen("tcp", *addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	applicationURL := "http://" + listener.Addr().String()
+	log.Printf("open %s", applicationURL)
+	if !*noBrowser {
+		if err := openBrowser(applicationURL); err != nil {
+			log.Printf("could not open browser: %v", err)
+		}
+	}
+	log.Fatal(http.Serve(listener, mux))
 }
 
 func (a *App) initDB(ctx context.Context) error {
@@ -1026,6 +1051,32 @@ func mustUserHome() string {
 		log.Fatal(err)
 	}
 	return home
+}
+
+func mustExecutableDir() string {
+	executable, err := os.Executable()
+	if err != nil {
+		log.Fatal(err)
+	}
+	return filepath.Dir(executable)
+}
+
+func isDevelopmentExecutable(directory string) bool {
+	normalized := filepath.ToSlash(directory)
+	return strings.Contains(normalized, "/go-build")
+}
+
+func openBrowser(applicationURL string) error {
+	var command *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		command = exec.Command("open", applicationURL)
+	case "windows":
+		command = exec.Command("rundll32", "url.dll,FileProtocolHandler", applicationURL)
+	default:
+		command = exec.Command("xdg-open", applicationURL)
+	}
+	return command.Start()
 }
 
 func mustConfigDir() string {

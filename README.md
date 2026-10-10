@@ -13,6 +13,8 @@ mise exec go@1.24 -- go run .
 
 If mise is activated in your shell, `go run .` is sufficient inside this directory.
 
+When a built binary is double-clicked, it uses the binary's directory as the bookshelf, stores its catalogue in `.book-manager/catalog.sqlite`, selects an available localhost port, and opens the default browser automatically. Use `-no-browser` for terminal use.
+
 Then open <http://127.0.0.1:8765>. The default bookshelf is `~/bookshelf` and the catalogue is stored in the platform user configuration directory.
 
 Options:
