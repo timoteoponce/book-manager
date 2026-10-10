@@ -103,8 +103,10 @@ func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", app.index)
 	mux.HandleFunc("/api/books", app.books)
+	mux.HandleFunc("/api/book/", app.book)
 	mux.HandleFunc("/api/sync", app.syncHandler)
 	mux.HandleFunc("/api/open/", app.open)
+	mux.HandleFunc("/api/preview/", app.preview)
 	log.Printf("book manager: %s", app.bookshelf)
 	log.Printf("open http://%s", *addr)
 	log.Fatal(http.ListenAndServe(*addr, mux))
@@ -295,13 +297,67 @@ func (a *App) syncHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, result)
 }
 
+func (a *App) book(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := bookID(r.URL.Path, "/api/book/")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var book Book
+	var available int
+	err = a.db.QueryRowContext(r.Context(), `SELECT id, path, folder, filename, title, author, format, size, modified_at, status, tags, notes, last_synced_at, available FROM books WHERE id = ?`, id).Scan(
+		&book.ID, &book.Path, &book.Folder, &book.Filename, &book.Title, &book.Author, &book.Format, &book.Size, &book.ModifiedAt, &book.Status, &book.Tags, &book.Notes, &book.LastSyncedAt, &available)
+	if errors.Is(err, sql.ErrNoRows) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	book.Available = available == 1
+	writeJSON(w, book)
+}
+
+func (a *App) preview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := bookID(r.URL.Path, "/api/preview/")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var relative string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT path FROM books WHERE id = ? AND available = 1`, id).Scan(&relative); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+	path := filepath.Join(a.bookshelf, filepath.FromSlash(relative))
+	if _, err := os.Stat(path); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	w.Header().Set("Content-Disposition", "inline")
+	http.ServeFile(w, r, path)
+}
+
 func (a *App) open(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var id int64
-	if _, err := fmt.Sscanf(strings.TrimPrefix(r.URL.Path, "/api/open/"), "%d", &id); err != nil {
+	id, err := bookID(r.URL.Path, "/api/open/")
+	if err != nil {
 		http.Error(w, "invalid book id", http.StatusBadRequest)
 		return
 	}
@@ -328,6 +384,18 @@ func (a *App) open(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]string{"status": "opened"})
+}
+
+func bookID(path, prefix string) (int64, error) {
+	value := strings.TrimPrefix(path, prefix)
+	var id int64
+	if value == "" || strings.ContainsAny(value, "/?&") {
+		return 0, errors.New("invalid book id")
+	}
+	if _, err := fmt.Sscanf(value, "%d", &id); err != nil || id < 1 {
+		return 0, errors.New("invalid book id")
+	}
+	return id, nil
 }
 
 func (a *App) index(w http.ResponseWriter, r *http.Request) {
