@@ -65,6 +65,13 @@ type SyncResult struct {
 	Unavailable int `json:"unavailable"`
 }
 
+type OrganizationProposal struct {
+	ID        int64  `json:"id"`
+	Current   string `json:"current"`
+	Proposed  string `json:"proposed"`
+	Collision bool   `json:"collision"`
+}
+
 type epubContainer struct {
 	Rootfiles []struct {
 		FullPath string `xml:"full-path,attr"`
@@ -124,6 +131,7 @@ func main() {
 	mux.HandleFunc("/api/books", app.books)
 	mux.HandleFunc("/api/book/", app.book)
 	mux.HandleFunc("/api/export", app.export)
+	mux.HandleFunc("/api/organize/preview", app.organizationPreview)
 	mux.HandleFunc("/api/sync", app.syncHandler)
 	mux.HandleFunc("/api/open/", app.open)
 	mux.HandleFunc("/api/preview/", app.preview)
@@ -421,6 +429,41 @@ func (a *App) export(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (a *App) organizationPreview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rows, err := a.db.QueryContext(r.Context(), `SELECT id, path, folder, filename, title, author, format, available FROM books WHERE available = 1 ORDER BY title COLLATE NOCASE`)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	proposals := []OrganizationProposal{}
+	used := map[string]bool{}
+	for rows.Next() {
+		var book Book
+		var available int
+		if err := rows.Scan(&book.ID, &book.Path, &book.Folder, &book.Filename, &book.Title, &book.Author, &book.Format, &available); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		book.Available = available == 1
+		target := organizationTarget(book)
+		key := strings.ToLower(filepath.ToSlash(target))
+		collision := used[key]
+		if !collision {
+			if _, err := os.Stat(filepath.Join(a.bookshelf, filepath.FromSlash(target))); err == nil && filepath.ToSlash(book.Path) != target {
+				collision = true
+			}
+		}
+		used[key] = true
+		proposals = append(proposals, OrganizationProposal{ID: book.ID, Current: book.Path, Proposed: target, Collision: collision})
+	}
+	writeJSON(w, map[string]any{"proposals": proposals, "count": len(proposals), "mutated": false})
+}
+
 func (a *App) preview(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -556,6 +599,48 @@ func displayMetadata(filename string) (string, string) {
 		return strings.TrimSpace(parts[1]), strings.TrimSpace(parts[0])
 	}
 	return base, ""
+}
+
+func organizationTarget(book Book) string {
+	category := "Bookshelf"
+	folder := filepath.ToSlash(book.Folder)
+	if folder != "." && folder != "" {
+		category = strings.Split(folder, "/")[0]
+	}
+	author := book.Author
+	if author == "" {
+		author = "Unknown Author"
+	}
+	title := book.Title
+	if title == "" {
+		title = strings.TrimSuffix(book.Filename, filepath.Ext(book.Filename))
+	}
+	ext := strings.ToLower(filepath.Ext(book.Filename))
+	if ext == "" && book.Format != "" {
+		ext = "." + strings.ToLower(book.Format)
+	}
+	return filepath.ToSlash(filepath.Join(sanitizePathPart(category), sanitizePathPart(author), sanitizePathPart(title)+ext))
+}
+
+func sanitizePathPart(value string) string {
+	var builder strings.Builder
+	for _, character := range strings.TrimSpace(value) {
+		if character < 32 || strings.ContainsRune(`<>:"/\\|?*`, character) {
+			builder.WriteRune('_')
+		} else {
+			builder.WriteRune(character)
+		}
+	}
+	value = strings.Trim(builder.String(), " .")
+	if value == "" {
+		return "Untitled"
+	}
+	for _, reserved := range []string{"CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"} {
+		if strings.EqualFold(value, reserved) {
+			return "_" + value
+		}
+	}
+	return value
 }
 
 var pdfInfoString = regexp.MustCompile(`/((?:Title)|(?:Author))\s*\(([^()]*)\)`)

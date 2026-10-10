@@ -121,3 +121,19 @@ func TestPDFMetadataReadsInfoDictionary(t *testing.T) {
 		t.Fatalf("metadata = %q, %q", title, author)
 	}
 }
+
+func TestOrganizationTargetIsHumanReadableAndSafe(t *testing.T) {
+	target := organizationTarget(Book{
+		Folder:   "Software Development/Legacy",
+		Filename: "Original.pdf",
+		Title:    `A <Practical> Book`,
+		Author:   "Jane/Doe",
+		Format:   "pdf",
+	})
+	if target != "Software Development/Jane_Doe/A _Practical_ Book.pdf" {
+		t.Fatalf("organization target = %q", target)
+	}
+	if sanitizePathPart("CON") != "_CON" {
+		t.Fatalf("reserved path part = %q", sanitizePathPart("CON"))
+	}
+}
