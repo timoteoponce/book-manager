@@ -72,6 +72,11 @@ type OrganizationProposal struct {
 	Collision bool   `json:"collision"`
 }
 
+type organizationMove struct {
+	Original string
+	New      string
+}
+
 type epubContainer struct {
 	Rootfiles []struct {
 		FullPath string `xml:"full-path,attr"`
@@ -132,6 +137,8 @@ func main() {
 	mux.HandleFunc("/api/book/", app.book)
 	mux.HandleFunc("/api/export", app.export)
 	mux.HandleFunc("/api/organize/preview", app.organizationPreview)
+	mux.HandleFunc("/api/organize/apply", app.organizationApply)
+	mux.HandleFunc("/api/organize/undo", app.organizationUndo)
 	mux.HandleFunc("/api/sync", app.syncHandler)
 	mux.HandleFunc("/api/open/", app.open)
 	mux.HandleFunc("/api/preview/", app.preview)
@@ -164,6 +171,14 @@ func (a *App) initDB(ctx context.Context) error {
 		);
 		CREATE INDEX IF NOT EXISTS books_title_idx ON books(title COLLATE NOCASE);
 		CREATE INDEX IF NOT EXISTS books_folder_idx ON books(folder COLLATE NOCASE);
+		CREATE TABLE IF NOT EXISTS organization_moves (
+			run_id TEXT NOT NULL,
+			original_path TEXT NOT NULL,
+			new_path TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			undone_at TEXT NOT NULL DEFAULT ''
+		);
+		CREATE INDEX IF NOT EXISTS organization_moves_run_idx ON organization_moves(run_id, created_at);
 	`); err != nil {
 		return err
 	}
@@ -434,10 +449,18 @@ func (a *App) organizationPreview(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	rows, err := a.db.QueryContext(r.Context(), `SELECT id, path, folder, filename, title, author, format, available FROM books WHERE available = 1 ORDER BY title COLLATE NOCASE`)
+	proposals, err := a.organizationProposals(r.Context())
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	writeJSON(w, map[string]any{"proposals": proposals, "count": len(proposals), "mutated": false})
+}
+
+func (a *App) organizationProposals(ctx context.Context) ([]OrganizationProposal, error) {
+	rows, err := a.db.QueryContext(ctx, `SELECT id, path, folder, filename, title, author, format, available FROM books WHERE available = 1 ORDER BY title COLLATE NOCASE`)
+	if err != nil {
+		return nil, err
 	}
 	defer rows.Close()
 	proposals := []OrganizationProposal{}
@@ -446,8 +469,7 @@ func (a *App) organizationPreview(w http.ResponseWriter, r *http.Request) {
 		var book Book
 		var available int
 		if err := rows.Scan(&book.ID, &book.Path, &book.Folder, &book.Filename, &book.Title, &book.Author, &book.Format, &available); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			return nil, err
 		}
 		book.Available = available == 1
 		target := organizationTarget(book)
@@ -461,7 +483,173 @@ func (a *App) organizationPreview(w http.ResponseWriter, r *http.Request) {
 		used[key] = true
 		proposals = append(proposals, OrganizationProposal{ID: book.ID, Current: book.Path, Proposed: target, Collision: collision})
 	}
-	writeJSON(w, map[string]any{"proposals": proposals, "count": len(proposals), "mutated": false})
+	return proposals, rows.Err()
+}
+
+func (a *App) organizationApply(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	proposals, err := a.organizationProposals(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for _, proposal := range proposals {
+		if proposal.Collision {
+			http.Error(w, "organization stopped: resolve all collisions in the preview first", http.StatusConflict)
+			return
+		}
+	}
+	moves := []organizationMove{}
+	for _, proposal := range proposals {
+		if filepath.ToSlash(proposal.Current) == proposal.Proposed {
+			continue
+		}
+		original := filepath.Join(a.bookshelf, filepath.FromSlash(proposal.Current))
+		newPath := filepath.Join(a.bookshelf, filepath.FromSlash(proposal.Proposed))
+		if _, err := os.Stat(original); err != nil {
+			a.rollbackOrganizationMoves(moves)
+			http.Error(w, "organization stopped: a source file is no longer available; sync first", http.StatusConflict)
+			return
+		}
+		if _, err := os.Lstat(newPath); err == nil {
+			a.rollbackOrganizationMoves(moves)
+			http.Error(w, "organization stopped: a target appeared after preview", http.StatusConflict)
+			return
+		} else if !errors.Is(err, os.ErrNotExist) {
+			a.rollbackOrganizationMoves(moves)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := os.MkdirAll(filepath.Dir(newPath), 0o755); err != nil {
+			a.rollbackOrganizationMoves(moves)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := os.Rename(original, newPath); err != nil {
+			a.rollbackOrganizationMoves(moves)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		moves = append(moves, organizationMove{Original: proposal.Current, New: proposal.Proposed})
+	}
+	if len(moves) == 0 {
+		writeJSON(w, map[string]any{"moved": 0, "message": "All books are already organized"})
+		return
+	}
+	if _, err := a.sync(r.Context()); err != nil {
+		a.rollbackOrganizationMoves(moves)
+		http.Error(w, "organization rolled back because sync failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	runID := time.Now().UTC().Format("20060102T150405.000000000Z")
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err == nil {
+		for _, move := range moves {
+			if _, err = tx.ExecContext(r.Context(), `INSERT INTO organization_moves (run_id, original_path, new_path, created_at) VALUES (?, ?, ?, ?)`, runID, move.Original, move.New, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+				break
+			}
+		}
+	}
+	if err != nil {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+		a.rollbackOrganizationMoves(moves)
+		_, _ = a.sync(r.Context())
+		http.Error(w, "organization rolled back because its undo record could not be saved: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err = tx.Commit(); err != nil {
+		a.rollbackOrganizationMoves(moves)
+		_, _ = a.sync(r.Context())
+		http.Error(w, "organization rolled back because its undo record could not be committed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"moved": len(moves), "runID": runID})
+}
+
+func (a *App) organizationUndo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var runID string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT run_id FROM organization_moves WHERE undone_at = '' ORDER BY created_at DESC LIMIT 1`).Scan(&runID); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.Error(w, "no organization run to undo", http.StatusNotFound)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+	rows, err := a.db.QueryContext(r.Context(), `SELECT original_path, new_path FROM organization_moves WHERE run_id = ? ORDER BY rowid DESC`, runID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	moves := []organizationMove{}
+	for rows.Next() {
+		var move organizationMove
+		if err := rows.Scan(&move.Original, &move.New); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		moves = append(moves, move)
+	}
+	for _, move := range moves {
+		original := filepath.Join(a.bookshelf, filepath.FromSlash(move.Original))
+		newPath := filepath.Join(a.bookshelf, filepath.FromSlash(move.New))
+		if _, err := os.Stat(newPath); err != nil {
+			http.Error(w, "undo stopped: an organized file is missing", http.StatusConflict)
+			return
+		}
+		if _, err := os.Lstat(original); err == nil {
+			http.Error(w, "undo stopped: an original path is occupied", http.StatusConflict)
+			return
+		} else if !errors.Is(err, os.ErrNotExist) {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	undone := []organizationMove{}
+	for _, move := range moves {
+		original := filepath.Join(a.bookshelf, filepath.FromSlash(move.Original))
+		newPath := filepath.Join(a.bookshelf, filepath.FromSlash(move.New))
+		if err := os.MkdirAll(filepath.Dir(original), 0o755); err != nil {
+			a.rollbackOrganizationMoves(undone)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := os.Rename(newPath, original); err != nil {
+			a.rollbackOrganizationMoves(undone)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		undone = append(undone, organizationMove{Original: move.New, New: move.Original})
+	}
+	if _, err := a.db.ExecContext(r.Context(), `UPDATE organization_moves SET undone_at = ? WHERE run_id = ?`, time.Now().UTC().Format(time.RFC3339Nano), runID); err != nil {
+		for _, move := range undone {
+			_ = os.Rename(filepath.Join(a.bookshelf, filepath.FromSlash(move.New)), filepath.Join(a.bookshelf, filepath.FromSlash(move.Original)))
+		}
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, err := a.sync(r.Context()); err != nil {
+		http.Error(w, "undo completed but sync failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"undone": len(moves), "runID": runID})
+}
+
+func (a *App) rollbackOrganizationMoves(moves []organizationMove) {
+	for index := len(moves) - 1; index >= 0; index-- {
+		move := moves[index]
+		_ = os.Rename(filepath.Join(a.bookshelf, filepath.FromSlash(move.New)), filepath.Join(a.bookshelf, filepath.FromSlash(move.Original)))
+	}
 }
 
 func (a *App) preview(w http.ResponseWriter, r *http.Request) {

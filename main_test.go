@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"io"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -135,5 +136,51 @@ func TestOrganizationTargetIsHumanReadableAndSafe(t *testing.T) {
 	}
 	if sanitizePathPart("CON") != "_CON" {
 		t.Fatalf("reserved path part = %q", sanitizePathPart("CON"))
+	}
+}
+
+func TestOrganizationApplyAndUndo(t *testing.T) {
+	bookshelf := t.TempDir()
+	original := filepath.Join(bookshelf, "Author - A Book.pdf")
+	if err := os.WriteFile(original, []byte("pdf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:organize-test?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	app := &App{db: db, bookshelf: bookshelf}
+	if err := app.initDB(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	applyResponse := httptest.NewRecorder()
+	app.organizationApply(applyResponse, httptest.NewRequest("POST", "/api/organize/apply", nil))
+	if applyResponse.Code != 200 {
+		t.Fatalf("apply status = %d: %s", applyResponse.Code, applyResponse.Body.String())
+	}
+	organized := filepath.Join(bookshelf, "Author", "A Book", "A Book.pdf")
+	if _, err := os.Stat(organized); err != nil {
+		t.Fatalf("organized file missing: %v", err)
+	}
+	if _, err := os.Stat(original); !os.IsNotExist(err) {
+		t.Fatalf("original file still exists: %v", err)
+	}
+
+	undoResponse := httptest.NewRecorder()
+	app.organizationUndo(undoResponse, httptest.NewRequest("POST", "/api/organize/undo", nil))
+	if undoResponse.Code != 200 {
+		t.Fatalf("undo status = %d: %s", undoResponse.Code, undoResponse.Body.String())
+	}
+	if _, err := os.Stat(original); err != nil {
+		t.Fatalf("original file not restored: %v", err)
+	}
+	if _, err := os.Stat(organized); !os.IsNotExist(err) {
+		t.Fatalf("organized file still exists: %v", err)
 	}
 }
