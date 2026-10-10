@@ -104,6 +104,7 @@ func main() {
 	mux.HandleFunc("/", app.index)
 	mux.HandleFunc("/api/books", app.books)
 	mux.HandleFunc("/api/book/", app.book)
+	mux.HandleFunc("/api/export", app.export)
 	mux.HandleFunc("/api/sync", app.syncHandler)
 	mux.HandleFunc("/api/open/", app.open)
 	mux.HandleFunc("/api/preview/", app.preview)
@@ -298,13 +299,17 @@ func (a *App) syncHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) book(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
 	id, err := bookID(r.URL.Path, "/api/book/")
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if r.Method == http.MethodPatch {
+		a.updateBook(w, r, id)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 	var book Book
@@ -321,6 +326,61 @@ func (a *App) book(w http.ResponseWriter, r *http.Request) {
 	}
 	book.Available = available == 1
 	writeJSON(w, book)
+}
+
+func (a *App) updateBook(w http.ResponseWriter, r *http.Request, id int64) {
+	var input struct {
+		Status string `json:"status"`
+		Tags   string `json:"tags"`
+		Notes  string `json:"notes"`
+	}
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 64*1024))
+	if err := decoder.Decode(&input); err != nil {
+		http.Error(w, "invalid metadata JSON", http.StatusBadRequest)
+		return
+	}
+	input.Status = strings.TrimSpace(input.Status)
+	if input.Status != "" && input.Status != "unread" && input.Status != "reading" && input.Status != "finished" && input.Status != "paused" {
+		http.Error(w, "invalid reading status", http.StatusBadRequest)
+		return
+	}
+	if _, err := a.db.ExecContext(r.Context(), `UPDATE books SET status = ?, tags = ?, notes = ? WHERE id = ?`, input.Status, strings.TrimSpace(input.Tags), strings.TrimSpace(input.Notes), id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "saved"})
+}
+
+func (a *App) export(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rows, err := a.db.QueryContext(r.Context(), `SELECT id, path, folder, filename, title, author, format, size, modified_at, status, tags, notes, last_synced_at, available FROM books ORDER BY title COLLATE NOCASE`)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	books := []Book{}
+	for rows.Next() {
+		var book Book
+		var available int
+		if err := rows.Scan(&book.ID, &book.Path, &book.Folder, &book.Filename, &book.Title, &book.Author, &book.Format, &book.Size, &book.ModifiedAt, &book.Status, &book.Tags, &book.Notes, &book.LastSyncedAt, &available); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		book.Available = available == 1
+		books = append(books, book)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", `attachment; filename="bookshelf-catalogue.json"`)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"version":    1,
+		"exportedAt": time.Now().UTC().Format(time.RFC3339),
+		"bookshelf":  a.bookshelf,
+		"books":      books,
+	})
 }
 
 func (a *App) preview(w http.ResponseWriter, r *http.Request) {
