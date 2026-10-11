@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -470,5 +472,162 @@ func TestDeleteCleanupCandidateMovesFileToTrash(t *testing.T) {
 	trashMatches, err := filepath.Glob(filepath.Join(bookshelf, ".book-manager", "trash", "*", "Author - Second.pdf"))
 	if err != nil || len(trashMatches) != 1 {
 		t.Fatalf("trash matches = %v, %v", trashMatches, err)
+	}
+}
+
+func newTestApp(t *testing.T, name string) *App {
+	t.Helper()
+	db, err := sql.Open("sqlite", "file:"+name+"?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	db.SetMaxOpenConns(1)
+	app := &App{db: db, bookshelf: t.TempDir()}
+	if err := app.initDB(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	return app
+}
+
+func TestSyncSkipsApplicationDataDirectory(t *testing.T) {
+	bookshelf := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(bookshelf, appDataDirName, "trash", "run1", "Nested"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bookshelf, "Real Book.pdf"), []byte("pdf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bookshelf, appDataDirName, "trash", "run1", "Nested", "Ghost.pdf"), []byte("pdf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:skip-data-dir?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	app := &App{db: db, bookshelf: bookshelf}
+	if err := app.initDB(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	result, err := app.sync(context.Background())
+	if err != nil || result.Indexed != 1 {
+		t.Fatalf("sync = %#v, %v", result, err)
+	}
+	var path string
+	if err := db.QueryRow(`SELECT path FROM books`).Scan(&path); err != nil {
+		t.Fatal(err)
+	}
+	if path != "Real Book.pdf" {
+		t.Fatalf("indexed path = %q", path)
+	}
+	var total int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM books WHERE path LIKE ?`, appDataDirName+"/%").Scan(&total); err != nil {
+		t.Fatal(err)
+	}
+	if total != 0 {
+		t.Fatalf("catalogue still contains %d app data rows", total)
+	}
+}
+
+func TestTrashListRestoreAndDelete(t *testing.T) {
+	app := newTestApp(t, "trash-restore")
+	if err := os.MkdirAll(filepath.Join(app.bookshelf, "Series"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	keep := filepath.Join(app.bookshelf, "Keep.pdf")
+	trashMe := filepath.Join(app.bookshelf, "Series", "Trash Me.pdf")
+	if err := os.WriteFile(keep, []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(trashMe, []byte("trash"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var id int64
+	if err := app.db.QueryRow(`SELECT id FROM books WHERE path = ?`, "Series/Trash Me.pdf").Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	deleted := httptest.NewRecorder()
+	app.deleteBooks(deleted, httptest.NewRequest("POST", "/api/books/delete", bytes.NewBufferString(fmt.Sprintf(`{"ids":[%d]}`, id))))
+	if deleted.Code != 200 {
+		t.Fatalf("delete status = %d: %s", deleted.Code, deleted.Body.String())
+	}
+	if _, err := os.Stat(trashMe); !os.IsNotExist(err) {
+		t.Fatalf("file still present after delete: %v", err)
+	}
+
+	listed := httptest.NewRecorder()
+	app.trashRuns(listed, httptest.NewRequest("GET", "/api/trash", nil))
+	if listed.Code != 200 {
+		t.Fatalf("trash list status = %d", listed.Code)
+	}
+	var payload struct {
+		Runs []TrashRun `json:"runs"`
+	}
+	if err := json.NewDecoder(listed.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	if len(payload.Runs) != 1 || payload.Runs[0].Files != 1 {
+		t.Fatalf("trash runs = %#v", payload.Runs)
+	}
+
+	restored := httptest.NewRecorder()
+	app.trashRestore(restored, httptest.NewRequest("POST", "/api/trash/restore", bytes.NewBufferString(fmt.Sprintf(`{"runId":%q}`, payload.Runs[0].ID))))
+	if restored.Code != 200 {
+		t.Fatalf("restore status = %d: %s", restored.Code, restored.Body.String())
+	}
+	if _, err := os.Stat(trashMe); err != nil {
+		t.Fatalf("file not restored: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(app.bookshelf, appDataDirName, "trash", payload.Runs[0].ID)); !os.IsNotExist(err) {
+		t.Fatalf("trash run directory still present: %v", err)
+	}
+	if _, err := app.sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var restoredPath string
+	if err := app.db.QueryRow(`SELECT path FROM books WHERE path = ?`, "Series/Trash Me.pdf").Scan(&restoredPath); err != nil {
+		t.Fatalf("restored book not re-indexed: %v", err)
+	}
+
+	// Delete another book, then purge the run permanently.
+	var secondID int64
+	if err := app.db.QueryRow(`SELECT id FROM books WHERE path = ?`, "Keep.pdf").Scan(&secondID); err != nil {
+		t.Fatal(err)
+	}
+	deleted = httptest.NewRecorder()
+	app.deleteBooks(deleted, httptest.NewRequest("POST", "/api/books/delete", bytes.NewBufferString(fmt.Sprintf(`{"ids":[%d]}`, secondID))))
+	if deleted.Code != 200 {
+		t.Fatalf("second delete status = %d: %s", deleted.Code, deleted.Body.String())
+	}
+	listed = httptest.NewRecorder()
+	app.trashRuns(listed, httptest.NewRequest("GET", "/api/trash", nil))
+	if err := json.NewDecoder(listed.Body).Decode(&payload); err != nil {
+		t.Fatal(err)
+	}
+	runID := payload.Runs[0].ID
+	purged := httptest.NewRecorder()
+	app.trashDelete(purged, httptest.NewRequest("POST", "/api/trash/delete", bytes.NewBufferString(fmt.Sprintf(`{"runId":%q}`, runID))))
+	if purged.Code != 200 {
+		t.Fatalf("purge status = %d: %s", purged.Code, purged.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(app.bookshelf, appDataDirName, "trash", runID)); !os.IsNotExist(err) {
+		t.Fatalf("run not purged: %v", err)
+	}
+}
+
+func TestTrashRejectsUnsafeRunID(t *testing.T) {
+	app := newTestApp(t, "trash-unsafe")
+	for _, runID := range []string{"../../etc", "a/b", "", "..", "run;rm -rf /"} {
+		request := httptest.NewRequest("POST", "/api/trash/delete", bytes.NewBufferString(fmt.Sprintf(`{"runId":%q}`, runID)))
+		response := httptest.NewRecorder()
+		app.trashDelete(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("run id %q accepted with status %d", runID, response.Code)
+		}
 	}
 }

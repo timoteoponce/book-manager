@@ -41,6 +41,12 @@ import (
 //go:embed web/index.html
 var webFS embed.FS
 
+const appDataDirName = ".book-manager"
+
+func trashRoot() string {
+	return filepath.Join(appDataDirName, "trash")
+}
+
 var supportedFormats = map[string]bool{
 	".azw": true, ".azw3": true, ".cb7": true, ".cbr": true, ".cbz": true,
 	".epub": true, ".fb2": true, ".mobi": true, ".pdf": true, ".txt": true,
@@ -113,6 +119,13 @@ type OrganizationProposal struct {
 	Current   string `json:"current"`
 	Proposed  string `json:"proposed"`
 	Collision bool   `json:"collision"`
+}
+
+type TrashRun struct {
+	ID        string `json:"id"`
+	Files     int64  `json:"files"`
+	Bytes     int64  `json:"bytes"`
+	CreatedAt string `json:"createdAt"`
 }
 
 type organizationMove struct {
@@ -250,6 +263,9 @@ func main() {
 	mux.HandleFunc("/api/book/", app.book)
 	mux.HandleFunc("/api/export", app.export)
 	mux.HandleFunc("/api/organize/preview", app.organizationPreview)
+	mux.HandleFunc("/api/trash", app.trashRuns)
+	mux.HandleFunc("/api/trash/restore", app.trashRestore)
+	mux.HandleFunc("/api/trash/delete", app.trashDelete)
 	mux.HandleFunc("/api/organize/apply", app.organizationApply)
 	mux.HandleFunc("/api/organize/undo", app.organizationUndo)
 	mux.HandleFunc("/api/sync", app.syncHandler)
@@ -444,6 +460,11 @@ func (a *App) syncUnlocked(ctx context.Context) (SyncResult, error) {
 			return err
 		}
 		if entry.IsDir() {
+			// The application data directory holds the catalogue and the
+			// recoverable trash; it must never be indexed as a library.
+			if entry.Name() == appDataDirName {
+				return filepath.SkipDir
+			}
 			return nil
 		}
 		ext := strings.ToLower(filepath.Ext(entry.Name()))
@@ -536,6 +557,11 @@ func (a *App) syncUnlocked(ctx context.Context) (SyncResult, error) {
 	}
 	if err = tx.Commit(); err != nil {
 		return SyncResult{}, err
+	}
+	// Remove any rows created by earlier builds that indexed the app data
+	// directory, so deleted books stop reappearing in the catalogue.
+	if _, err := a.db.ExecContext(ctx, `DELETE FROM books WHERE path = ? OR path LIKE ?`, appDataDirName, appDataDirName+"/%"); err != nil {
+		log.Printf("failed to remove app data rows: %v", err)
 	}
 	_ = a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM books WHERE available = 0`).Scan(&result.Unavailable)
 	return result, nil
@@ -1137,6 +1163,158 @@ func (a *App) export(w http.ResponseWriter, r *http.Request) {
 		"bookshelf":  a.bookshelf,
 		"books":      books,
 	})
+}
+
+func (a *App) trashRuns(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	root := filepath.Join(a.bookshelf, filepath.FromSlash(trashRoot()))
+	entries, err := os.ReadDir(root)
+	if errors.Is(err, os.ErrNotExist) {
+		writeJSON(w, map[string]any{"runs": []TrashRun{}, "totalBytes": 0, "totalFiles": 0})
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	runs := []TrashRun{}
+	var totalBytes, totalFiles int64
+	for _, entry := range entries {
+		if !entry.IsDir() || strings.HasPrefix(entry.Name(), ".") {
+			continue
+		}
+		run := TrashRun{ID: entry.Name()}
+		_ = filepath.WalkDir(filepath.Join(root, entry.Name()), func(path string, item fs.DirEntry, err error) error {
+			if err != nil || item.IsDir() {
+				return nil
+			}
+			if info, err := item.Info(); err == nil {
+				run.Bytes += info.Size()
+				run.Files++
+			}
+			return nil
+		})
+		if info, err := entry.Info(); err == nil {
+			run.CreatedAt = info.ModTime().UTC().Format(time.RFC3339)
+		}
+		runs = append(runs, run)
+		totalBytes += run.Bytes
+		totalFiles += run.Files
+	}
+	sort.Slice(runs, func(i, j int) bool { return runs[i].ID > runs[j].ID })
+	writeJSON(w, map[string]any{"runs": runs, "totalBytes": totalBytes, "totalFiles": totalFiles})
+}
+
+func (a *App) trashRestore(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var request struct {
+		RunID string `json:"runId"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8*1024)).Decode(&request); err != nil || !validTrashRunID(request.RunID) {
+		http.Error(w, "a valid trash run is required", http.StatusBadRequest)
+		return
+	}
+	runPath := filepath.Join(a.bookshelf, filepath.FromSlash(trashRoot()), request.RunID)
+	if _, err := os.Stat(runPath); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	var restored int
+	var restoreErr error
+	var directories []string
+	err := filepath.WalkDir(runPath, func(path string, entry fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if entry.IsDir() {
+			if path != runPath {
+				directories = append(directories, path)
+			}
+			return nil
+		}
+		relative, err := filepath.Rel(runPath, path)
+		if err != nil {
+			return err
+		}
+		target := filepath.Join(a.bookshelf, relative)
+		if _, err := os.Lstat(target); err == nil {
+			restoreErr = errors.New("cannot restore: original path already occupied: " + filepath.ToSlash(relative))
+			return restoreErr
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			return err
+		}
+		if err := os.Rename(path, target); err != nil {
+			return err
+		}
+		restored++
+		return nil
+	})
+	if err != nil {
+		message := "restore failed"
+		if restoreErr != nil {
+			message = restoreErr.Error()
+		}
+		http.Error(w, message, http.StatusConflict)
+		return
+	}
+	// Files were moved out, so drop the now-empty directory skeleton.
+	for index := len(directories) - 1; index >= 0; index-- {
+		_ = os.Remove(directories[index])
+	}
+	if err := os.Remove(runPath); err != nil {
+		http.Error(w, "restored files but could not remove the trash run: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if _, err := a.sync(r.Context()); err != nil {
+		http.Error(w, "files restored but sync failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]int{"restored": restored})
+}
+
+func (a *App) trashDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var request struct {
+		RunID string `json:"runId"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8*1024)).Decode(&request); err != nil || !validTrashRunID(request.RunID) {
+		http.Error(w, "a valid trash run is required", http.StatusBadRequest)
+		return
+	}
+	runPath := filepath.Join(a.bookshelf, filepath.FromSlash(trashRoot()), request.RunID)
+	if _, err := os.Stat(runPath); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+	if err := os.RemoveAll(runPath); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "deleted"})
+}
+
+func validTrashRunID(runID string) bool {
+	if runID == "" || len(runID) > 64 {
+		return false
+	}
+	for _, character := range runID {
+		if !(character >= '0' && character <= '9' || character >= 'A' && character <= 'Z' || character >= 'a' && character <= 'z' || character == '.' || character == '-' || character == '_') {
+			return false
+		}
+	}
+	return !strings.Contains(runID, "..")
 }
 
 func (a *App) organizationPreview(w http.ResponseWriter, r *http.Request) {

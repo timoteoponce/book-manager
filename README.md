@@ -22,8 +22,10 @@ Implemented:
 - Editable tags, notes, and reading status.
 - Metadata consolidation into supported EPUB and PDF files using atomic replacement.
 - Single-book and bulk deletion through recoverable `.book-manager/trash/` moves.
+- A Trash view that lists deletion runs with file counts and sizes, and can restore a run or delete it permanently. Nothing is ever removed automatically.
 - Icon-based card actions with tooltips, including open, show in folder, details, and delete.
 - Show-in-folder support for macOS (Finder), Windows (Explorer), and Linux (parent folder).
+- Select-all selection control for bulk actions.
 - JSON catalogue export.
 - Optional Open Library metadata lookup with per-book candidate selection.
 - Human-readable organization preview and collision-safe moves:
@@ -41,6 +43,7 @@ Implemented:
 ## Safety Model
 
 - Normal sync never moves, renames, or deletes book files.
+- The `.book-manager` data directory is never indexed, so trashed books cannot reappear in the catalogue.
 - Online metadata fetching is opt-in and never changes metadata automatically.
 - Metadata changes from online sources require selecting a candidate first.
 - Organization requires a preview and refuses collisions.
