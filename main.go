@@ -43,14 +43,20 @@ var supportedFormats = map[string]bool{
 }
 
 type App struct {
-	db            *sql.DB
-	bookshelf     string
-	syncMu        sync.Mutex
-	stateMu       sync.RWMutex
-	syncing       bool
-	lastSync      SyncResult
-	lastSyncErr   string
-	lastHeartbeat time.Time
+	db                *sql.DB
+	bookshelf         string
+	syncMu            sync.Mutex
+	stateMu           sync.RWMutex
+	syncing           bool
+	lastSync          SyncResult
+	lastSyncErr       string
+	lastHeartbeat     time.Time
+	metadataRunning   bool
+	metadataOperation string
+	metadataCurrent   int
+	metadataTotal     int
+	metadataFailed    int
+	metadataError     string
 }
 
 type Book struct {
@@ -244,6 +250,7 @@ func main() {
 	mux.HandleFunc("/api/metadata/fetch-online", app.fetchOnlineMetadata)
 	mux.HandleFunc("/api/metadata/candidates", app.onlineMetadataCandidates)
 	mux.HandleFunc("/api/metadata/apply-online", app.applyOnlineMetadata)
+	mux.HandleFunc("/api/metadata/status", app.metadataStatus)
 	log.Printf("book manager: %s", app.bookshelf)
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -525,6 +532,64 @@ func (a *App) heartbeat(w http.ResponseWriter, r *http.Request) {
 	a.lastHeartbeat = time.Now()
 	a.stateMu.Unlock()
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *App) startMetadataJob(operation string) bool {
+	a.stateMu.Lock()
+	defer a.stateMu.Unlock()
+	if a.metadataRunning || a.syncing {
+		return false
+	}
+	a.metadataRunning = true
+	a.metadataOperation = operation
+	a.metadataCurrent = 0
+	a.metadataTotal = 0
+	a.metadataFailed = 0
+	a.metadataError = ""
+	return true
+}
+
+func (a *App) setMetadataTotal(total int) {
+	a.stateMu.Lock()
+	a.metadataTotal = total
+	a.stateMu.Unlock()
+}
+
+func (a *App) setMetadataProgress(current, failed int) {
+	a.stateMu.Lock()
+	a.metadataCurrent = current
+	a.metadataFailed = failed
+	a.stateMu.Unlock()
+}
+
+func (a *App) finishMetadataJob(current, failed int, err error) {
+	a.stateMu.Lock()
+	a.metadataRunning = false
+	a.metadataCurrent = current
+	a.metadataFailed = failed
+	a.metadataError = ""
+	if err != nil {
+		a.metadataError = err.Error()
+	}
+	a.stateMu.Unlock()
+}
+
+func (a *App) metadataStatus(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	a.stateMu.RLock()
+	response := map[string]any{
+		"running":   a.metadataRunning,
+		"operation": a.metadataOperation,
+		"current":   a.metadataCurrent,
+		"total":     a.metadataTotal,
+		"failed":    a.metadataFailed,
+		"error":     a.metadataError,
+	}
+	a.stateMu.RUnlock()
+	writeJSON(w, response)
 }
 
 func (a *App) monitorBrowser(server *http.Server) {
@@ -1474,54 +1539,16 @@ func (a *App) refreshMetadata(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	a.syncMu.Lock()
-	defer a.syncMu.Unlock()
-	rows, err := a.db.QueryContext(r.Context(), `SELECT id, path, format FROM books WHERE available = 1 ORDER BY id`)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if !a.startMetadataJob("local") {
+		http.Error(w, "metadata operation already in progress", http.StatusConflict)
 		return
 	}
-	type bookFile struct {
-		id     int64
-		path   string
-		format string
-	}
-	files := []bookFile{}
-	for rows.Next() {
-		var file bookFile
-		if err := rows.Scan(&file.id, &file.path, &file.format); err != nil {
-			_ = rows.Close()
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		files = append(files, file)
-	}
-	if err := rows.Err(); err != nil {
-		_ = rows.Close()
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	_ = rows.Close()
-	refreshed, failed := 0, 0
-	for _, file := range files {
-		metadata, err := extractMetadata(filepath.Join(a.bookshelf, filepath.FromSlash(file.path)), file.format)
-		if err != nil {
-			failed++
-			continue
-		}
-		_, err = a.db.ExecContext(r.Context(), `UPDATE books SET title = CASE WHEN ? != '' THEN ? ELSE title END, author = CASE WHEN ? != '' THEN ? ELSE author END WHERE id = ?`, metadata.Title, metadata.Title, metadata.Author, metadata.Author, file.id)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		_, err = a.db.ExecContext(r.Context(), `INSERT INTO book_metadata (book_id, publisher, published_at, isbn, language, description, refreshed_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id) DO UPDATE SET publisher=excluded.publisher, published_at=excluded.published_at, isbn=excluded.isbn, language=excluded.language, description=excluded.description, refreshed_at=excluded.refreshed_at`, file.id, metadata.Publisher, metadata.PublishedAt, metadata.ISBN, metadata.Language, metadata.Description, time.Now().UTC().Format(time.RFC3339Nano))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		refreshed++
-	}
-	writeJSON(w, map[string]int{"refreshed": refreshed, "failed": failed})
+	go func() {
+		refreshed, failed, err := a.refreshMetadataJob(context.Background())
+		a.finishMetadataJob(refreshed, failed, err)
+	}()
+	w.WriteHeader(http.StatusAccepted)
+	writeJSON(w, map[string]bool{"started": true})
 }
 
 func (a *App) fetchOnlineMetadata(w http.ResponseWriter, r *http.Request) {
@@ -1529,57 +1556,113 @@ func (a *App) fetchOnlineMetadata(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	a.syncMu.Lock()
-	defer a.syncMu.Unlock()
-	rows, err := a.db.QueryContext(r.Context(), `SELECT b.id, b.title, b.author, COALESCE(m.isbn, '') FROM books b LEFT JOIN book_metadata m ON m.book_id = b.id WHERE b.available = 1 ORDER BY b.title COLLATE NOCASE`)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+	if !a.startMetadataJob("online") {
+		http.Error(w, "metadata operation already in progress", http.StatusConflict)
 		return
 	}
+	go func() {
+		books, candidates, failed, err := a.fetchOnlineMetadataJob(context.Background())
+		a.finishMetadataJob(books, failed, err)
+		_ = candidates
+	}()
+	w.WriteHeader(http.StatusAccepted)
+	writeJSON(w, map[string]bool{"started": true})
+}
+
+func (a *App) refreshMetadataJob(ctx context.Context) (int, int, error) {
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+	rows, err := a.db.QueryContext(ctx, `SELECT id, path, format FROM books WHERE available = 1 ORDER BY id`)
+	if err != nil {
+		return 0, 0, err
+	}
+	type bookFile struct {
+		id           int64
+		path, format string
+	}
+	files := []bookFile{}
+	for rows.Next() {
+		var file bookFile
+		if err := rows.Scan(&file.id, &file.path, &file.format); err != nil {
+			_ = rows.Close()
+			return 0, 0, err
+		}
+		files = append(files, file)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return 0, 0, err
+	}
+	_ = rows.Close()
+	a.setMetadataTotal(len(files))
+	refreshed, failed := 0, 0
+	for index, file := range files {
+		metadata, err := extractMetadata(filepath.Join(a.bookshelf, filepath.FromSlash(file.path)), file.format)
+		if err != nil {
+			failed++
+			a.setMetadataProgress(index+1, failed)
+			continue
+		}
+		if _, err = a.db.ExecContext(ctx, `UPDATE books SET title = CASE WHEN ? != '' THEN ? ELSE title END, author = CASE WHEN ? != '' THEN ? ELSE author END WHERE id = ?`, metadata.Title, metadata.Title, metadata.Author, metadata.Author, file.id); err != nil {
+			return refreshed, failed, err
+		}
+		if _, err = a.db.ExecContext(ctx, `INSERT INTO book_metadata (book_id, publisher, published_at, isbn, language, description, refreshed_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id) DO UPDATE SET publisher=excluded.publisher, published_at=excluded.published_at, isbn=excluded.isbn, language=excluded.language, description=excluded.description, refreshed_at=excluded.refreshed_at`, file.id, metadata.Publisher, metadata.PublishedAt, metadata.ISBN, metadata.Language, metadata.Description, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return refreshed, failed, err
+		}
+		refreshed++
+		a.setMetadataProgress(index+1, failed)
+	}
+	return refreshed, failed, nil
+}
+
+func (a *App) fetchOnlineMetadataJob(ctx context.Context) (int, int, int, error) {
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+	rows, err := a.db.QueryContext(ctx, `SELECT b.id, b.title, b.author, COALESCE(m.isbn, '') FROM books b LEFT JOIN book_metadata m ON m.book_id = b.id WHERE b.available = 1 ORDER BY b.title COLLATE NOCASE`)
+	if err != nil {
+		return 0, 0, 0, err
+	}
 	type lookup struct {
-		id     int64
-		title  string
-		author string
-		isbn   string
+		id                  int64
+		title, author, isbn string
 	}
 	lookups := []lookup{}
 	for rows.Next() {
 		var item lookup
 		if err := rows.Scan(&item.id, &item.title, &item.author, &item.isbn); err != nil {
 			_ = rows.Close()
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+			return 0, 0, 0, err
 		}
 		lookups = append(lookups, item)
 	}
 	if err := rows.Err(); err != nil {
 		_ = rows.Close()
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
+		return 0, 0, 0, err
 	}
 	_ = rows.Close()
+	a.setMetadataTotal(len(lookups))
 	client := &http.Client{Timeout: 15 * time.Second}
 	fetched, failed := 0, 0
-	for _, item := range lookups {
-		matches, err := openLibraryLookup(r.Context(), client, item.title, item.author, item.isbn)
+	for index, item := range lookups {
+		matches, err := openLibraryLookup(ctx, client, item.title, item.author, item.isbn)
 		if err != nil {
 			failed++
+			a.setMetadataProgress(index+1, failed)
 			continue
 		}
-		if _, err := a.db.ExecContext(r.Context(), `DELETE FROM metadata_candidates WHERE book_id = ?`, item.id); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
+		if _, err := a.db.ExecContext(ctx, `DELETE FROM metadata_candidates WHERE book_id = ?`, item.id); err != nil {
+			return len(lookups), fetched, failed, err
 		}
 		for _, match := range matches {
-			_, err := a.db.ExecContext(r.Context(), `INSERT INTO metadata_candidates (book_id, provider, external_id, title, author, publisher, published_at, isbn, language, description, cover_url, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id, provider, external_id) DO UPDATE SET title=excluded.title, author=excluded.author, publisher=excluded.publisher, published_at=excluded.published_at, isbn=excluded.isbn, language=excluded.language, description=excluded.description, cover_url=excluded.cover_url, fetched_at=excluded.fetched_at`, item.id, match.Provider, match.ExternalID, match.Title, match.Author, match.Publisher, match.PublishedAt, match.ISBN, match.Language, match.Description, match.CoverURL, match.FetchedAt)
+			_, err := a.db.ExecContext(ctx, `INSERT INTO metadata_candidates (book_id, provider, external_id, title, author, publisher, published_at, isbn, language, description, cover_url, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id, provider, external_id) DO UPDATE SET title=excluded.title, author=excluded.author, publisher=excluded.publisher, published_at=excluded.published_at, isbn=excluded.isbn, language=excluded.language, description=excluded.description, cover_url=excluded.cover_url, fetched_at=excluded.fetched_at`, item.id, match.Provider, match.ExternalID, match.Title, match.Author, match.Publisher, match.PublishedAt, match.ISBN, match.Language, match.Description, match.CoverURL, match.FetchedAt)
 			if err != nil {
-				http.Error(w, err.Error(), http.StatusInternalServerError)
-				return
+				return len(lookups), fetched, failed, err
 			}
 			fetched++
 		}
+		a.setMetadataProgress(index+1, failed)
 	}
-	writeJSON(w, map[string]int{"books": len(lookups), "candidates": fetched, "failed": failed})
+	return len(lookups), fetched, failed, nil
 }
 
 func openLibraryLookup(ctx context.Context, client *http.Client, title, author, isbn string) ([]OnlineMetadataCandidate, error) {
