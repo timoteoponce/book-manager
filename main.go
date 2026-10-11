@@ -43,13 +43,14 @@ var supportedFormats = map[string]bool{
 }
 
 type App struct {
-	db          *sql.DB
-	bookshelf   string
-	syncMu      sync.Mutex
-	stateMu     sync.RWMutex
-	syncing     bool
-	lastSync    SyncResult
-	lastSyncErr string
+	db            *sql.DB
+	bookshelf     string
+	syncMu        sync.Mutex
+	stateMu       sync.RWMutex
+	syncing       bool
+	lastSync      SyncResult
+	lastSyncErr   string
+	lastHeartbeat time.Time
 }
 
 type Book struct {
@@ -175,6 +176,7 @@ func main() {
 	mux.HandleFunc("/api/organize/undo", app.organizationUndo)
 	mux.HandleFunc("/api/sync", app.syncHandler)
 	mux.HandleFunc("/api/sync/status", app.syncStatus)
+	mux.HandleFunc("/api/heartbeat", app.heartbeat)
 	mux.HandleFunc("/api/open/", app.open)
 	mux.HandleFunc("/api/preview/", app.preview)
 	mux.HandleFunc("/api/cover/", app.cover)
@@ -187,18 +189,30 @@ func main() {
 	}
 	applicationURL := "http://" + listener.Addr().String()
 	log.Printf("open %s", applicationURL)
+	browserOpened := false
 	if !*noBrowser {
 		if err := openBrowser(applicationURL); err != nil {
 			log.Printf("could not open browser: %v", err)
+		} else {
+			browserOpened = true
 		}
 	}
+	app.stateMu.Lock()
+	app.lastHeartbeat = time.Now()
+	app.stateMu.Unlock()
 	app.setSyncing(true)
 	go func() {
 		if _, err := app.syncInBackground(context.Background()); err != nil {
 			log.Printf("initial sync failed: %v", err)
 		}
 	}()
-	log.Fatal(http.Serve(listener, mux))
+	server := &http.Server{Handler: mux}
+	if browserOpened {
+		go app.monitorBrowser(server)
+	}
+	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
+		log.Fatal(err)
+	}
 }
 
 func (a *App) initDB(ctx context.Context) error {
@@ -303,7 +317,7 @@ func (a *App) syncUnlocked(ctx context.Context) (SyncResult, error) {
 		cacheErr := a.db.QueryRowContext(ctx, `SELECT title, author, fingerprint, size, modified_at FROM books WHERE path = ?`, filepath.ToSlash(rel)).Scan(&cachedTitle, &cachedAuthor, &cachedFingerprint, &cachedSize, &cachedModified)
 		title, author := displayMetadata(entry.Name())
 		fingerprint := ""
-		if cacheErr == nil && cachedFingerprint != "" && cachedSize == info.Size() && cachedModified == modified {
+		if cacheErr == nil && cachedFingerprint != "" && cachedSize == info.Size() && cachedModified == modified && metadataCacheUsable(cachedTitle, cachedAuthor) {
 			title, author, fingerprint = cachedTitle, cachedAuthor, cachedFingerprint
 		} else {
 			fingerprint, err = fileFingerprint(path)
@@ -412,6 +426,35 @@ func (a *App) syncStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, response)
 }
 
+func (a *App) heartbeat(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	a.stateMu.Lock()
+	a.lastHeartbeat = time.Now()
+	a.stateMu.Unlock()
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func (a *App) monitorBrowser(server *http.Server) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for now := range ticker.C {
+		a.stateMu.RLock()
+		lastHeartbeat := a.lastHeartbeat
+		a.stateMu.RUnlock()
+		if now.Sub(lastHeartbeat) < 20*time.Second {
+			continue
+		}
+		log.Printf("browser heartbeat stopped; shutting down")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = server.Shutdown(ctx)
+		cancel()
+		return
+	}
+}
+
 func (a *App) cleanupCandidatesHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -436,6 +479,7 @@ func (a *App) cleanupCandidates(ctx context.Context) ([]CleanupCandidate, error)
 		fingerprint string
 	}
 	duplicates := map[string][]duplicateRecord{}
+	allRecords := []duplicateRecord{}
 	for rows.Next() {
 		var record duplicateRecord
 		if err := rows.Scan(&record.candidate.ID, &record.candidate.Path, &record.candidate.Title, &record.candidate.Author, &record.candidate.Format, &record.candidate.Size, &record.candidate.ModifiedAt, &record.fingerprint); err != nil {
@@ -445,17 +489,42 @@ func (a *App) cleanupCandidates(ctx context.Context) ([]CleanupCandidate, error)
 		record.candidate.Confidence = "high"
 		record.candidate.Available = true
 		duplicates[record.fingerprint] = append(duplicates[record.fingerprint], record)
+		allRecords = append(allRecords, record)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
 	candidates := []CleanupCandidate{}
+	flagged := map[int64]bool{}
 	for _, records := range duplicates {
 		if len(records) < 2 {
 			continue
 		}
 		keeper := records[0].candidate.Path
 		for _, record := range records[1:] {
+			record.candidate.DuplicateOf = keeper
+			candidates = append(candidates, record.candidate)
+			flagged[record.candidate.ID] = true
+		}
+	}
+	byTitleAuthor := map[string][]duplicateRecord{}
+	for _, record := range allRecords {
+		key := cleanupKey(record.candidate.Title, record.candidate.Author)
+		if key != "" {
+			byTitleAuthor[key] = append(byTitleAuthor[key], record)
+		}
+	}
+	for _, records := range byTitleAuthor {
+		if len(records) < 2 {
+			continue
+		}
+		keeper := records[0].candidate.Path
+		for _, record := range records[1:] {
+			if flagged[record.candidate.ID] {
+				continue
+			}
+			record.candidate.Reason = "possible_duplicate"
+			record.candidate.Confidence = "medium"
 			record.candidate.DuplicateOf = keeper
 			candidates = append(candidates, record.candidate)
 		}
@@ -475,6 +544,15 @@ func (a *App) cleanupCandidates(ctx context.Context) ([]CleanupCandidate, error)
 		candidates = append(candidates, candidate)
 	}
 	return candidates, missingRows.Err()
+}
+
+func cleanupKey(title, author string) string {
+	title = strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(title))), " ")
+	author = strings.Join(strings.Fields(strings.ToLower(strings.TrimSpace(author))), " ")
+	if title == "" {
+		return ""
+	}
+	return title + "\x00" + author
 }
 
 func (a *App) forgetCleanupRecord(w http.ResponseWriter, r *http.Request) {
@@ -1001,6 +1079,12 @@ func displayMetadata(filename string) (string, string) {
 		return strings.TrimSpace(parts[1]), strings.TrimSpace(parts[0])
 	}
 	return base, ""
+}
+
+func metadataCacheUsable(title, author string) bool {
+	// Older versions stored PDF escape sequences as literal text. Reparse those
+	// records once so the corrected decoder can repair the catalogue in place.
+	return !strings.Contains(title, "\\") && !strings.Contains(author, "\\")
 }
 
 func organizationTarget(book Book) string {
