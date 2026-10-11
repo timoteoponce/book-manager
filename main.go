@@ -2,10 +2,12 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"database/sql"
 	"embed"
+	"encoding/binary"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -27,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	_ "modernc.org/sqlite"
 )
@@ -781,7 +784,9 @@ func (a *App) preview(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	w.Header().Set("Content-Type", "application/pdf")
 	w.Header().Set("Content-Disposition", "inline")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	http.ServeFile(w, r, path)
 }
 
@@ -954,13 +959,54 @@ func pdfMetadata(path string) (string, string) {
 }
 
 func decodePDFString(value string) string {
-	value = strings.ReplaceAll(value, `\n`, "\n")
-	value = strings.ReplaceAll(value, `\r`, "\r")
-	value = strings.ReplaceAll(value, `\t`, "\t")
-	value = strings.ReplaceAll(value, `\(`, "(")
-	value = strings.ReplaceAll(value, `\)`, ")")
-	value = strings.ReplaceAll(value, `\\`, `\`)
-	return strings.TrimSpace(value)
+	decoded := make([]byte, 0, len(value))
+	for index := 0; index < len(value); index++ {
+		if value[index] != '\\' || index+1 >= len(value) {
+			decoded = append(decoded, value[index])
+			continue
+		}
+		index++
+		switch value[index] {
+		case 'n':
+			decoded = append(decoded, '\n')
+		case 'r':
+			decoded = append(decoded, '\r')
+		case 't':
+			decoded = append(decoded, '\t')
+		case 'b':
+			decoded = append(decoded, '\b')
+		case 'f':
+			decoded = append(decoded, '\f')
+		case '(', ')', '\\':
+			decoded = append(decoded, value[index])
+		default:
+			if value[index] < '0' || value[index] > '7' {
+				decoded = append(decoded, value[index])
+				continue
+			}
+			octal := int(value[index] - '0')
+			for digits := 1; digits < 3 && index+1 < len(value) && value[index+1] >= '0' && value[index+1] <= '7'; digits++ {
+				index++
+				octal = octal*8 + int(value[index]-'0')
+			}
+			decoded = append(decoded, byte(octal))
+		}
+	}
+	if bytes.HasPrefix(decoded, []byte{0xfe, 0xff}) {
+		return strings.TrimSpace(decodeUTF16(decoded[2:], binary.BigEndian))
+	}
+	if bytes.HasPrefix(decoded, []byte{0xff, 0xfe}) {
+		return strings.TrimSpace(decodeUTF16(decoded[2:], binary.LittleEndian))
+	}
+	return strings.TrimSpace(string(decoded))
+}
+
+func decodeUTF16(data []byte, order binary.ByteOrder) string {
+	units := make([]uint16, 0, len(data)/2)
+	for index := 0; index+1 < len(data); index += 2 {
+		units = append(units, order.Uint16(data[index:index+2]))
+	}
+	return string(utf16.Decode(units))
 }
 
 func epubMetadata(path string) (string, string) {

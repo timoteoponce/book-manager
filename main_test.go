@@ -157,6 +157,19 @@ func TestPDFMetadataReadsInfoDictionary(t *testing.T) {
 	}
 }
 
+func TestPDFMetadataDecodesEscapedUTF16Title(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "utf16-title.pdf")
+	encodedTitle := `\376\377\000W\000h\000a\000t\000\040\000y\000o\000u\000\040\000n\000e\000e\000d\000\040\000t\000o\000\040\000k\000n\000o\000w\000\040\000a\000b\000o\000u\000t\000\040\000d\000a\000t\000e\000s\000\040\000a\000n\000d\000\040\000t\000i\000m\000e\000s\000\040\000i\000n\000\040\000c\000o\000m\000p\000u\000t\000i\000n\000g`
+	if err := os.WriteFile(path, []byte("7 0 obj << /Title ("+encodedTitle+") >> endobj"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	title, _ := pdfMetadata(path)
+	expected := "What you need to know about dates and times in computing"
+	if title != expected {
+		t.Fatalf("decoded title = %q, want %q", title, expected)
+	}
+}
+
 func TestOrganizationTargetIsHumanReadableAndSafe(t *testing.T) {
 	target := organizationTarget(Book{
 		Folder:   "Software Development/Legacy",
