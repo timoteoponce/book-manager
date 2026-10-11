@@ -75,6 +75,20 @@ type SyncResult struct {
 	Unavailable int `json:"unavailable"`
 }
 
+type CleanupCandidate struct {
+	ID          int64  `json:"id"`
+	Reason      string `json:"reason"`
+	Confidence  string `json:"confidence"`
+	Path        string `json:"path"`
+	Title       string `json:"title"`
+	Author      string `json:"author"`
+	Format      string `json:"format"`
+	Size        int64  `json:"size"`
+	ModifiedAt  string `json:"modifiedAt"`
+	DuplicateOf string `json:"duplicateOf,omitempty"`
+	Available   bool   `json:"available"`
+}
+
 type OrganizationProposal struct {
 	ID        int64  `json:"id"`
 	Current   string `json:"current"`
@@ -164,6 +178,8 @@ func main() {
 	mux.HandleFunc("/api/open/", app.open)
 	mux.HandleFunc("/api/preview/", app.preview)
 	mux.HandleFunc("/api/cover/", app.cover)
+	mux.HandleFunc("/api/cleanup/candidates", app.cleanupCandidatesHandler)
+	mux.HandleFunc("/api/cleanup/forget/", app.forgetCleanupRecord)
 	log.Printf("book manager: %s", app.bookshelf)
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -394,6 +410,94 @@ func (a *App) syncStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	a.stateMu.RUnlock()
 	writeJSON(w, response)
+}
+
+func (a *App) cleanupCandidatesHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	candidates, err := a.cleanupCandidates(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"candidates": candidates, "count": len(candidates)})
+}
+
+func (a *App) cleanupCandidates(ctx context.Context) ([]CleanupCandidate, error) {
+	rows, err := a.db.QueryContext(ctx, `SELECT id, path, title, author, format, size, modified_at, fingerprint FROM books WHERE available = 1 AND fingerprint != '' ORDER BY fingerprint, modified_at, path`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	type duplicateRecord struct {
+		candidate   CleanupCandidate
+		fingerprint string
+	}
+	duplicates := map[string][]duplicateRecord{}
+	for rows.Next() {
+		var record duplicateRecord
+		if err := rows.Scan(&record.candidate.ID, &record.candidate.Path, &record.candidate.Title, &record.candidate.Author, &record.candidate.Format, &record.candidate.Size, &record.candidate.ModifiedAt, &record.fingerprint); err != nil {
+			return nil, err
+		}
+		record.candidate.Reason = "exact_duplicate"
+		record.candidate.Confidence = "high"
+		record.candidate.Available = true
+		duplicates[record.fingerprint] = append(duplicates[record.fingerprint], record)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	candidates := []CleanupCandidate{}
+	for _, records := range duplicates {
+		if len(records) < 2 {
+			continue
+		}
+		keeper := records[0].candidate.Path
+		for _, record := range records[1:] {
+			record.candidate.DuplicateOf = keeper
+			candidates = append(candidates, record.candidate)
+		}
+	}
+	missingRows, err := a.db.QueryContext(ctx, `SELECT id, path, title, author, format, size, modified_at FROM books WHERE available = 0 ORDER BY title COLLATE NOCASE, path`)
+	if err != nil {
+		return nil, err
+	}
+	defer missingRows.Close()
+	for missingRows.Next() {
+		var candidate CleanupCandidate
+		if err := missingRows.Scan(&candidate.ID, &candidate.Path, &candidate.Title, &candidate.Author, &candidate.Format, &candidate.Size, &candidate.ModifiedAt); err != nil {
+			return nil, err
+		}
+		candidate.Reason = "unavailable_record"
+		candidate.Confidence = "high"
+		candidates = append(candidates, candidate)
+	}
+	return candidates, missingRows.Err()
+}
+
+func (a *App) forgetCleanupRecord(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := bookID(r.URL.Path, "/api/cleanup/forget/")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	result, err := a.db.ExecContext(r.Context(), `DELETE FROM books WHERE id = ? AND available = 0`, id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	count, _ := result.RowsAffected()
+	if count == 0 {
+		http.Error(w, "only unavailable catalogue records can be forgotten", http.StatusConflict)
+		return
+	}
+	writeJSON(w, map[string]bool{"forgotten": true})
 }
 
 func (a *App) books(w http.ResponseWriter, r *http.Request) {

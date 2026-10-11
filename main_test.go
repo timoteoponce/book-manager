@@ -4,6 +4,7 @@ import (
 	"archive/zip"
 	"context"
 	"database/sql"
+	"fmt"
 	"io"
 	"net/http/httptest"
 	"os"
@@ -229,5 +230,49 @@ func TestOrganizationApplyAndUndo(t *testing.T) {
 	}
 	if _, err := os.Stat(organized); !os.IsNotExist(err) {
 		t.Fatalf("organized file still exists: %v", err)
+	}
+}
+
+func TestCleanupCandidatesFindDuplicatesAndMissingRecords(t *testing.T) {
+	bookshelf := t.TempDir()
+	first := filepath.Join(bookshelf, "Author - First.pdf")
+	second := filepath.Join(bookshelf, "Author - Second.pdf")
+	if err := os.WriteFile(first, []byte("same content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("same content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:cleanup-test?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	app := &App{db: db, bookshelf: bookshelf}
+	if err := app.initDB(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := app.cleanupCandidates(context.Background())
+	if err != nil || len(candidates) != 1 || candidates[0].Reason != "exact_duplicate" {
+		t.Fatalf("duplicate candidates = %#v, %v", candidates, err)
+	}
+	if err := os.Remove(second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err = app.cleanupCandidates(context.Background())
+	if err != nil || len(candidates) != 1 || candidates[0].Reason != "unavailable_record" {
+		t.Fatalf("missing candidates = %#v, %v", candidates, err)
+	}
+	response := httptest.NewRecorder()
+	app.forgetCleanupRecord(response, httptest.NewRequest("POST", "/api/cleanup/forget/"+fmt.Sprint(candidates[0].ID), nil))
+	if response.Code != 200 {
+		t.Fatalf("forget status = %d: %s", response.Code, response.Body.String())
 	}
 }
