@@ -4,6 +4,13 @@ A lightweight, local-first catalogue for an existing bookshelf. Book Manager ind
 
 The application is a single Go binary with an embedded web interface. It does not require Electron, Tauri, a database server, or an application runtime.
 
+## Contributing
+
+Read [`AGENTS.md`](AGENTS.md) first. It documents the architecture, the build
+commands that actually work on this machine, and the constraints that must not be
+broken (offline by default, filesystem is the source of truth, never delete without
+confirmation).
+
 ## Current Status
 
 Usable personal-library prototype. The core catalogue, metadata review, cleanup, and organization workflows are implemented, but packaging and cross-platform smoke testing still need to be completed before calling it a stable release.
@@ -115,20 +122,27 @@ Results are stored as candidates. The user reviews candidates per book and choos
 Format, test, and build:
 
 ```sh
-mise exec go@1.24 -- gofmt -w main.go main_test.go
+mise exec go@1.24 -- gofmt -l main.go main_test.go
 mise exec go@1.24 -- go test ./...
-CGO_ENABLED=0 mise exec go@1.24 -- go build ./...
+CGO_ENABLED=0 mise exec go@1.24 -- go build -o book-manager ./...
 ```
 
-The test suite covers sync preservation, rename detection, cache reuse, EPUB covers and metadata, PDF metadata decoding, organization moves and undo, and cleanup behavior.
+Always pass the tool version to `mise exec` (`mise exec go@1.24 -- ...`); a bare
+`mise exec` fails on this machine because the global mise config pins an
+unavailable Java version. See [`AGENTS.md`](AGENTS.md) for the full toolchain notes.
+
+The test suite covers sync preservation, rename detection, cache reuse, EPUB covers,
+series, PDF metadata decoding, organization moves and undo, cleanup, app-data
+directory exclusion, and trash restore and purge.
 
 ## Roadmap
 
 - Cross-platform packaging and smoke tests on Windows and macOS.
-- Better progress reporting for very large scans.
-- More format-specific metadata and preview support.
+- CBZ/CBR/MOBI metadata extraction and cover art.
+- Series name normalisation so the same series from different sources groups together.
+- Series browsing: group a whole series and read it in volume order.
+- Full-text search (FTS) for larger libraries.
 - Optional additional metadata providers.
-- Restore tooling for the recoverable cleanup trash.
 - More UI tests and accessibility polish.
 
 ## Privacy
