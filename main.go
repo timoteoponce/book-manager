@@ -68,6 +68,11 @@ type Book struct {
 	Notes        string `json:"notes"`
 	LastSyncedAt string `json:"lastSyncedAt"`
 	Available    bool   `json:"available"`
+	Publisher    string `json:"publisher,omitempty"`
+	PublishedAt  string `json:"publishedAt,omitempty"`
+	ISBN         string `json:"isbn,omitempty"`
+	Language     string `json:"language,omitempty"`
+	Description  string `json:"description,omitempty"`
 }
 
 type SyncResult struct {
@@ -88,6 +93,7 @@ type CleanupCandidate struct {
 	ModifiedAt  string `json:"modifiedAt"`
 	DuplicateOf string `json:"duplicateOf,omitempty"`
 	Available   bool   `json:"available"`
+	ISBN        string `json:"isbn,omitempty"`
 }
 
 type OrganizationProposal struct {
@@ -110,9 +116,14 @@ type epubContainer struct {
 
 type opfPackage struct {
 	Metadata struct {
-		Title   string     `xml:"title"`
-		Creator string     `xml:"creator"`
-		Items   []epubMeta `xml:"meta"`
+		Title       string           `xml:"title"`
+		Creator     string           `xml:"creator"`
+		Publisher   string           `xml:"publisher"`
+		Date        string           `xml:"date"`
+		Language    string           `xml:"language"`
+		Description string           `xml:"description"`
+		Identifiers []epubIdentifier `xml:"identifier"`
+		Items       []epubMeta       `xml:"meta"`
 	} `xml:"metadata"`
 	Manifest struct {
 		Items []epubManifestItem `xml:"item"`
@@ -129,6 +140,21 @@ type epubManifestItem struct {
 type epubMeta struct {
 	Name    string `xml:"name,attr"`
 	Content string `xml:"content,attr"`
+}
+
+type extractedMetadata struct {
+	Title       string
+	Author      string
+	Publisher   string
+	PublishedAt string
+	ISBN        string
+	Language    string
+	Description string
+}
+
+type epubIdentifier struct {
+	Value  string `xml:",chardata"`
+	Scheme string `xml:"scheme,attr"`
 }
 
 func main() {
@@ -183,6 +209,7 @@ func main() {
 	mux.HandleFunc("/api/cleanup/candidates", app.cleanupCandidatesHandler)
 	mux.HandleFunc("/api/cleanup/forget/", app.forgetCleanupRecord)
 	mux.HandleFunc("/api/cleanup/delete", app.deleteCleanupCandidates)
+	mux.HandleFunc("/api/metadata/refresh", app.refreshMetadata)
 	log.Printf("book manager: %s", app.bookshelf)
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -247,6 +274,16 @@ func (a *App) initDB(ctx context.Context) error {
 			undone_at TEXT NOT NULL DEFAULT ''
 		);
 		CREATE INDEX IF NOT EXISTS organization_moves_run_idx ON organization_moves(run_id, created_at);
+		CREATE TABLE IF NOT EXISTS book_metadata (
+			book_id INTEGER PRIMARY KEY,
+			publisher TEXT NOT NULL DEFAULT '',
+			published_at TEXT NOT NULL DEFAULT '',
+			isbn TEXT NOT NULL DEFAULT '',
+			language TEXT NOT NULL DEFAULT '',
+			description TEXT NOT NULL DEFAULT '',
+			refreshed_at TEXT NOT NULL,
+			FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
+		);
 	`); err != nil {
 		return err
 	}
@@ -470,7 +507,7 @@ func (a *App) cleanupCandidatesHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) cleanupCandidates(ctx context.Context) ([]CleanupCandidate, error) {
-	rows, err := a.db.QueryContext(ctx, `SELECT id, path, title, author, format, size, modified_at, fingerprint FROM books WHERE available = 1 AND fingerprint != '' ORDER BY fingerprint, modified_at, path`)
+	rows, err := a.db.QueryContext(ctx, `SELECT b.id, b.path, b.title, b.author, b.format, b.size, b.modified_at, b.fingerprint, COALESCE(m.isbn, '') FROM books b LEFT JOIN book_metadata m ON m.book_id = b.id WHERE b.available = 1 AND b.fingerprint != '' ORDER BY b.fingerprint, b.modified_at, b.path`)
 	if err != nil {
 		return nil, err
 	}
@@ -483,7 +520,7 @@ func (a *App) cleanupCandidates(ctx context.Context) ([]CleanupCandidate, error)
 	allRecords := []duplicateRecord{}
 	for rows.Next() {
 		var record duplicateRecord
-		if err := rows.Scan(&record.candidate.ID, &record.candidate.Path, &record.candidate.Title, &record.candidate.Author, &record.candidate.Format, &record.candidate.Size, &record.candidate.ModifiedAt, &record.fingerprint); err != nil {
+		if err := rows.Scan(&record.candidate.ID, &record.candidate.Path, &record.candidate.Title, &record.candidate.Author, &record.candidate.Format, &record.candidate.Size, &record.candidate.ModifiedAt, &record.fingerprint, &record.candidate.ISBN); err != nil {
 			return nil, err
 		}
 		record.candidate.Reason = "exact_duplicate"
@@ -503,6 +540,28 @@ func (a *App) cleanupCandidates(ctx context.Context) ([]CleanupCandidate, error)
 		}
 		keeper := records[0].candidate.Path
 		for _, record := range records[1:] {
+			record.candidate.DuplicateOf = keeper
+			candidates = append(candidates, record.candidate)
+			flagged[record.candidate.ID] = true
+		}
+	}
+	byISBN := map[string][]duplicateRecord{}
+	for _, record := range allRecords {
+		if record.candidate.ISBN != "" {
+			byISBN[record.candidate.ISBN] = append(byISBN[record.candidate.ISBN], record)
+		}
+	}
+	for _, records := range byISBN {
+		if len(records) < 2 {
+			continue
+		}
+		keeper := records[0].candidate.Path
+		for _, record := range records[1:] {
+			if flagged[record.candidate.ID] {
+				continue
+			}
+			record.candidate.Reason = "same_isbn"
+			record.candidate.Confidence = "high"
 			record.candidate.DuplicateOf = keeper
 			candidates = append(candidates, record.candidate)
 			flagged[record.candidate.ID] = true
@@ -767,7 +826,19 @@ func (a *App) book(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	book.Available = available == 1
+	if err := a.loadBookMetadata(r.Context(), &book); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
 	writeJSON(w, book)
+}
+
+func (a *App) loadBookMetadata(ctx context.Context, book *Book) error {
+	err := a.db.QueryRowContext(ctx, `SELECT publisher, published_at, isbn, language, description FROM book_metadata WHERE book_id = ?`, book.ID).Scan(&book.Publisher, &book.PublishedAt, &book.ISBN, &book.Language, &book.Description)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	return err
 }
 
 func (a *App) updateBook(w http.ResponseWriter, r *http.Request, id int64) {
@@ -1299,6 +1370,106 @@ func epubMetadata(path string) (string, string) {
 		return "", ""
 	}
 	return strings.TrimSpace(pkg.Metadata.Title), strings.TrimSpace(pkg.Metadata.Creator)
+}
+
+func extractMetadata(path, format string) (extractedMetadata, error) {
+	switch format {
+	case "epub":
+		z, err := zip.OpenReader(path)
+		if err != nil {
+			return extractedMetadata{}, err
+		}
+		defer z.Close()
+		pkg, _, err := epubPackage(z)
+		if err != nil {
+			return extractedMetadata{}, err
+		}
+		metadata := extractedMetadata{
+			Title: pkg.Metadata.Title, Author: pkg.Metadata.Creator, Publisher: pkg.Metadata.Publisher,
+			PublishedAt: pkg.Metadata.Date, Language: pkg.Metadata.Language, Description: pkg.Metadata.Description,
+		}
+		for _, identifier := range pkg.Metadata.Identifiers {
+			if isbn := normalizeISBN(identifier.Value); isbn != "" {
+				metadata.ISBN = isbn
+				break
+			}
+		}
+		return metadata, nil
+	case "pdf":
+		title, author := pdfMetadata(path)
+		return extractedMetadata{Title: title, Author: author}, nil
+	default:
+		return extractedMetadata{}, nil
+	}
+}
+
+func normalizeISBN(value string) string {
+	var builder strings.Builder
+	for _, character := range strings.ToUpper(value) {
+		if character >= '0' && character <= '9' || character == 'X' {
+			builder.WriteRune(character)
+		}
+	}
+	isbn := builder.String()
+	if len(isbn) == 10 || len(isbn) == 13 {
+		return isbn
+	}
+	return ""
+}
+
+func (a *App) refreshMetadata(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+	rows, err := a.db.QueryContext(r.Context(), `SELECT id, path, format FROM books WHERE available = 1 ORDER BY id`)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	type bookFile struct {
+		id     int64
+		path   string
+		format string
+	}
+	files := []bookFile{}
+	for rows.Next() {
+		var file bookFile
+		if err := rows.Scan(&file.id, &file.path, &file.format); err != nil {
+			_ = rows.Close()
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		files = append(files, file)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_ = rows.Close()
+	refreshed, failed := 0, 0
+	for _, file := range files {
+		metadata, err := extractMetadata(filepath.Join(a.bookshelf, filepath.FromSlash(file.path)), file.format)
+		if err != nil {
+			failed++
+			continue
+		}
+		_, err = a.db.ExecContext(r.Context(), `UPDATE books SET title = CASE WHEN ? != '' THEN ? ELSE title END, author = CASE WHEN ? != '' THEN ? ELSE author END WHERE id = ?`, metadata.Title, metadata.Title, metadata.Author, metadata.Author, file.id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		_, err = a.db.ExecContext(r.Context(), `INSERT INTO book_metadata (book_id, publisher, published_at, isbn, language, description, refreshed_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id) DO UPDATE SET publisher=excluded.publisher, published_at=excluded.published_at, isbn=excluded.isbn, language=excluded.language, description=excluded.description, refreshed_at=excluded.refreshed_at`, file.id, metadata.Publisher, metadata.PublishedAt, metadata.ISBN, metadata.Language, metadata.Description, time.Now().UTC().Format(time.RFC3339Nano))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		refreshed++
+	}
+	writeJSON(w, map[string]int{"refreshed": refreshed, "failed": failed})
 }
 
 func epubPackage(z *zip.ReadCloser) (*opfPackage, string, error) {

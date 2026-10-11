@@ -148,6 +148,41 @@ func TestEPUBCoverSupportsEPUB2Metadata(t *testing.T) {
 	}
 }
 
+func TestEPUBMetadataExtractsIdentifierAndPublicationData(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "metadata.epub")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := zip.NewWriter(file)
+	entries := map[string]string{
+		"META-INF/container.xml": `<?xml version="1.0"?><container><rootfiles><rootfile full-path="content.opf"/></rootfiles></container>`,
+		"content.opf":            `<package><metadata><title>A Book</title><creator>Jane Doe</creator><publisher>Example Press</publisher><date>2024-01-02</date><language>en</language><identifier scheme="ISBN">9780306406157</identifier></metadata></package>`,
+	}
+	for name, content := range entries {
+		writer, err := archive.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	metadata, err := extractMetadata(path, "epub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Title != "A Book" || metadata.Author != "Jane Doe" || metadata.Publisher != "Example Press" || metadata.PublishedAt != "2024-01-02" || metadata.ISBN != "9780306406157" {
+		t.Fatalf("metadata = %#v", metadata)
+	}
+}
+
 func TestPDFMetadataReadsInfoDictionary(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "book.pdf")
 	if err := os.WriteFile(path, []byte("7 0 obj << /Title (A PDF Title) /Author (Jane Doe) >> endobj"), 0o644); err != nil {
