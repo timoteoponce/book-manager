@@ -248,6 +248,7 @@ func main() {
 	mux.HandleFunc("/api/cleanup/delete", app.deleteCleanupCandidates)
 	mux.HandleFunc("/api/metadata/refresh", app.refreshMetadata)
 	mux.HandleFunc("/api/metadata/fetch-online", app.fetchOnlineMetadata)
+	mux.HandleFunc("/api/metadata/search", app.searchBookMetadata)
 	mux.HandleFunc("/api/metadata/candidates", app.onlineMetadataCandidates)
 	mux.HandleFunc("/api/metadata/apply-online", app.applyOnlineMetadata)
 	mux.HandleFunc("/api/metadata/status", app.metadataStatus)
@@ -1567,6 +1568,51 @@ func (a *App) fetchOnlineMetadata(w http.ResponseWriter, r *http.Request) {
 	}()
 	w.WriteHeader(http.StatusAccepted)
 	writeJSON(w, map[string]bool{"started": true})
+}
+
+func (a *App) searchBookMetadata(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var request struct {
+		BookID int64  `json:"bookId"`
+		Query  string `json:"query"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 8*1024)).Decode(&request); err != nil {
+		http.Error(w, "invalid search request", http.StatusBadRequest)
+		return
+	}
+	request.Query = strings.TrimSpace(request.Query)
+	if request.BookID < 1 || request.Query == "" || len(request.Query) > 300 {
+		http.Error(w, "book and search text are required", http.StatusBadRequest)
+		return
+	}
+	var bookTitle string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT title FROM books WHERE id = ? AND available = 1`, request.BookID).Scan(&bookTitle); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+	matches, err := openLibraryLookup(r.Context(), &http.Client{Timeout: 15 * time.Second}, request.Query, "", "")
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	if _, err := a.db.ExecContext(r.Context(), `DELETE FROM metadata_candidates WHERE book_id = ?`, request.BookID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for _, match := range matches {
+		if _, err := a.db.ExecContext(r.Context(), `INSERT INTO metadata_candidates (book_id, provider, external_id, title, author, publisher, published_at, isbn, language, description, cover_url, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id, provider, external_id) DO UPDATE SET title=excluded.title, author=excluded.author, publisher=excluded.publisher, published_at=excluded.published_at, isbn=excluded.isbn, language=excluded.language, description=excluded.description, cover_url=excluded.cover_url, fetched_at=excluded.fetched_at`, request.BookID, match.Provider, match.ExternalID, match.Title, match.Author, match.Publisher, match.PublishedAt, match.ISBN, match.Language, match.Description, match.CoverURL, match.FetchedAt); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	writeJSON(w, map[string]any{"bookId": request.BookID, "bookTitle": bookTitle, "candidates": len(matches)})
 }
 
 func (a *App) refreshMetadataJob(ctx context.Context) (int, int, error) {
