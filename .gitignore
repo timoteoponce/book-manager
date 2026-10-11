@@ -1,0 +1,13 @@
+# Local build artifacts
+/book-manager
+/book-manager.exe
+/book-manager-*
+
+# Local catalogue data when running from the repository
+/.book-manager/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+
+# Go tooling
+/vendor/
