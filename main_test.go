@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/zip"
+	"bytes"
 	"context"
 	"database/sql"
 	"fmt"
@@ -274,5 +275,48 @@ func TestCleanupCandidatesFindDuplicatesAndMissingRecords(t *testing.T) {
 	app.forgetCleanupRecord(response, httptest.NewRequest("POST", "/api/cleanup/forget/"+fmt.Sprint(candidates[0].ID), nil))
 	if response.Code != 200 {
 		t.Fatalf("forget status = %d: %s", response.Code, response.Body.String())
+	}
+}
+
+func TestDeleteCleanupCandidateMovesFileToTrash(t *testing.T) {
+	bookshelf := t.TempDir()
+	first := filepath.Join(bookshelf, "Author - First.pdf")
+	second := filepath.Join(bookshelf, "Author - Second.pdf")
+	if err := os.WriteFile(first, []byte("same content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("same content"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:cleanup-delete-test?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	app := &App{db: db, bookshelf: bookshelf}
+	if err := app.initDB(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	candidates, err := app.cleanupCandidates(context.Background())
+	if err != nil || len(candidates) != 1 {
+		t.Fatalf("candidates = %#v, %v", candidates, err)
+	}
+	request := httptest.NewRequest("POST", "/api/cleanup/delete", bytes.NewBufferString(fmt.Sprintf(`{"ids":[%d]}`, candidates[0].ID)))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	app.deleteCleanupCandidates(response, request)
+	if response.Code != 200 {
+		t.Fatalf("delete status = %d: %s", response.Code, response.Body.String())
+	}
+	if _, err := os.Stat(second); !os.IsNotExist(err) {
+		t.Fatalf("candidate file still at source: %v", err)
+	}
+	trashMatches, err := filepath.Glob(filepath.Join(bookshelf, ".book-manager", "trash", "*", "Author - Second.pdf"))
+	if err != nil || len(trashMatches) != 1 {
+		t.Fatalf("trash matches = %v, %v", trashMatches, err)
 	}
 }

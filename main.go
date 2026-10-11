@@ -182,6 +182,7 @@ func main() {
 	mux.HandleFunc("/api/cover/", app.cover)
 	mux.HandleFunc("/api/cleanup/candidates", app.cleanupCandidatesHandler)
 	mux.HandleFunc("/api/cleanup/forget/", app.forgetCleanupRecord)
+	mux.HandleFunc("/api/cleanup/delete", app.deleteCleanupCandidates)
 	log.Printf("book manager: %s", app.bookshelf)
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -576,6 +577,96 @@ func (a *App) forgetCleanupRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, map[string]bool{"forgotten": true})
+}
+
+func (a *App) deleteCleanupCandidates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var request struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32*1024)).Decode(&request); err != nil || len(request.IDs) == 0 {
+		http.Error(w, "select at least one cleanup candidate", http.StatusBadRequest)
+		return
+	}
+	candidates, err := a.cleanupCandidates(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	byID := make(map[int64]CleanupCandidate, len(candidates))
+	for _, candidate := range candidates {
+		byID[candidate.ID] = candidate
+	}
+	runID := time.Now().UTC().Format("20060102T150405.000000000Z")
+	moves := []organizationMove{}
+	deleteIDs := []int64{}
+	seen := map[int64]bool{}
+	for _, id := range request.IDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		candidate, ok := byID[id]
+		if !ok {
+			a.rollbackOrganizationMoves(moves)
+			http.Error(w, "cleanup candidate is stale; refresh the list", http.StatusConflict)
+			return
+		}
+		if candidate.Available {
+			source := filepath.Join(a.bookshelf, filepath.FromSlash(candidate.Path))
+			if _, err := os.Stat(source); err != nil {
+				a.rollbackOrganizationMoves(moves)
+				http.Error(w, "candidate file is no longer available; sync first", http.StatusConflict)
+				return
+			}
+			trashRelative := filepath.ToSlash(filepath.Join(".book-manager", "trash", runID, filepath.FromSlash(candidate.Path)))
+			trashPath := filepath.Join(a.bookshelf, filepath.FromSlash(trashRelative))
+			if _, err := os.Lstat(trashPath); err == nil {
+				a.rollbackOrganizationMoves(moves)
+				http.Error(w, "trash destination already exists; try again", http.StatusConflict)
+				return
+			} else if !errors.Is(err, os.ErrNotExist) {
+				a.rollbackOrganizationMoves(moves)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if err := os.MkdirAll(filepath.Dir(trashPath), 0o755); err != nil {
+				a.rollbackOrganizationMoves(moves)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if err := os.Rename(source, trashPath); err != nil {
+				a.rollbackOrganizationMoves(moves)
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			moves = append(moves, organizationMove{Original: candidate.Path, New: trashRelative})
+		}
+		deleteIDs = append(deleteIDs, id)
+	}
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err == nil {
+		for _, id := range deleteIDs {
+			if _, err = tx.ExecContext(r.Context(), `DELETE FROM books WHERE id = ?`, id); err != nil {
+				break
+			}
+		}
+	}
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err != nil {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+		a.rollbackOrganizationMoves(moves)
+		http.Error(w, "cleanup rolled back: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"deleted": len(moves), "forgotten": len(deleteIDs) - len(moves), "trashRun": runID})
 }
 
 func (a *App) books(w http.ResponseWriter, r *http.Request) {
