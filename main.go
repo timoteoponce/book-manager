@@ -152,6 +152,37 @@ type extractedMetadata struct {
 	Description string
 }
 
+type OnlineMetadataCandidate struct {
+	ID          int64  `json:"id"`
+	BookID      int64  `json:"bookId"`
+	BookTitle   string `json:"bookTitle"`
+	Provider    string `json:"provider"`
+	ExternalID  string `json:"externalId"`
+	Title       string `json:"title"`
+	Author      string `json:"author"`
+	Publisher   string `json:"publisher"`
+	PublishedAt string `json:"publishedAt"`
+	ISBN        string `json:"isbn"`
+	Language    string `json:"language"`
+	Description string `json:"description"`
+	CoverURL    string `json:"coverUrl"`
+	FetchedAt   string `json:"fetchedAt"`
+}
+
+type openLibrarySearch struct {
+	Docs []struct {
+		Key              string   `json:"key"`
+		Title            string   `json:"title"`
+		AuthorName       []string `json:"author_name"`
+		Publisher        []string `json:"publisher"`
+		PublishDate      []string `json:"publish_date"`
+		FirstPublishYear int      `json:"first_publish_year"`
+		ISBN             []string `json:"isbn"`
+		Language         []string `json:"language"`
+		CoverID          int      `json:"cover_i"`
+	} `json:"docs"`
+}
+
 type epubIdentifier struct {
 	Value  string `xml:",chardata"`
 	Scheme string `xml:"scheme,attr"`
@@ -210,6 +241,9 @@ func main() {
 	mux.HandleFunc("/api/cleanup/forget/", app.forgetCleanupRecord)
 	mux.HandleFunc("/api/cleanup/delete", app.deleteCleanupCandidates)
 	mux.HandleFunc("/api/metadata/refresh", app.refreshMetadata)
+	mux.HandleFunc("/api/metadata/fetch-online", app.fetchOnlineMetadata)
+	mux.HandleFunc("/api/metadata/candidates", app.onlineMetadataCandidates)
+	mux.HandleFunc("/api/metadata/apply-online", app.applyOnlineMetadata)
 	log.Printf("book manager: %s", app.bookshelf)
 	listener, err := net.Listen("tcp", *addr)
 	if err != nil {
@@ -284,6 +318,24 @@ func (a *App) initDB(ctx context.Context) error {
 			refreshed_at TEXT NOT NULL,
 			FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
 		);
+		CREATE TABLE IF NOT EXISTS metadata_candidates (
+			id INTEGER PRIMARY KEY,
+			book_id INTEGER NOT NULL,
+			provider TEXT NOT NULL,
+			external_id TEXT NOT NULL,
+			title TEXT NOT NULL DEFAULT '',
+			author TEXT NOT NULL DEFAULT '',
+			publisher TEXT NOT NULL DEFAULT '',
+			published_at TEXT NOT NULL DEFAULT '',
+			isbn TEXT NOT NULL DEFAULT '',
+			language TEXT NOT NULL DEFAULT '',
+			description TEXT NOT NULL DEFAULT '',
+			cover_url TEXT NOT NULL DEFAULT '',
+			fetched_at TEXT NOT NULL,
+			UNIQUE(book_id, provider, external_id),
+			FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
+		);
+		CREATE INDEX IF NOT EXISTS metadata_candidates_book_idx ON metadata_candidates(book_id);
 	`); err != nil {
 		return err
 	}
@@ -1470,6 +1522,208 @@ func (a *App) refreshMetadata(w http.ResponseWriter, r *http.Request) {
 		refreshed++
 	}
 	writeJSON(w, map[string]int{"refreshed": refreshed, "failed": failed})
+}
+
+func (a *App) fetchOnlineMetadata(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	a.syncMu.Lock()
+	defer a.syncMu.Unlock()
+	rows, err := a.db.QueryContext(r.Context(), `SELECT b.id, b.title, b.author, COALESCE(m.isbn, '') FROM books b LEFT JOIN book_metadata m ON m.book_id = b.id WHERE b.available = 1 ORDER BY b.title COLLATE NOCASE`)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	type lookup struct {
+		id     int64
+		title  string
+		author string
+		isbn   string
+	}
+	lookups := []lookup{}
+	for rows.Next() {
+		var item lookup
+		if err := rows.Scan(&item.id, &item.title, &item.author, &item.isbn); err != nil {
+			_ = rows.Close()
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		lookups = append(lookups, item)
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	_ = rows.Close()
+	client := &http.Client{Timeout: 15 * time.Second}
+	fetched, failed := 0, 0
+	for _, item := range lookups {
+		matches, err := openLibraryLookup(r.Context(), client, item.title, item.author, item.isbn)
+		if err != nil {
+			failed++
+			continue
+		}
+		if _, err := a.db.ExecContext(r.Context(), `DELETE FROM metadata_candidates WHERE book_id = ?`, item.id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		for _, match := range matches {
+			_, err := a.db.ExecContext(r.Context(), `INSERT INTO metadata_candidates (book_id, provider, external_id, title, author, publisher, published_at, isbn, language, description, cover_url, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id, provider, external_id) DO UPDATE SET title=excluded.title, author=excluded.author, publisher=excluded.publisher, published_at=excluded.published_at, isbn=excluded.isbn, language=excluded.language, description=excluded.description, cover_url=excluded.cover_url, fetched_at=excluded.fetched_at`, item.id, match.Provider, match.ExternalID, match.Title, match.Author, match.Publisher, match.PublishedAt, match.ISBN, match.Language, match.Description, match.CoverURL, match.FetchedAt)
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			fetched++
+		}
+	}
+	writeJSON(w, map[string]int{"books": len(lookups), "candidates": fetched, "failed": failed})
+}
+
+func openLibraryLookup(ctx context.Context, client *http.Client, title, author, isbn string) ([]OnlineMetadataCandidate, error) {
+	query := url.Values{}
+	query.Set("limit", "5")
+	query.Set("fields", "key,title,author_name,publisher,publish_date,first_publish_year,isbn,language,cover_i")
+	if isbn != "" {
+		query.Set("isbn", isbn)
+	} else {
+		query.Set("title", title)
+		if author != "" {
+			query.Set("author", author)
+		}
+	}
+	request, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://openlibrary.org/search.json?"+query.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	request.Header.Set("User-Agent", "book-manager/1.0 (local personal library)")
+	response, err := client.Do(request)
+	if err != nil {
+		return nil, err
+	}
+	defer response.Body.Close()
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
+		return nil, fmt.Errorf("open library returned %s", response.Status)
+	}
+	var result openLibrarySearch
+	if err := json.NewDecoder(io.LimitReader(response.Body, 4<<20)).Decode(&result); err != nil {
+		return nil, err
+	}
+	fetchedAt := time.Now().UTC().Format(time.RFC3339)
+	candidates := make([]OnlineMetadataCandidate, 0, len(result.Docs))
+	for _, doc := range result.Docs {
+		published := firstString(doc.PublishDate)
+		if published == "" && doc.FirstPublishYear != 0 {
+			published = fmt.Sprint(doc.FirstPublishYear)
+		}
+		candidate := OnlineMetadataCandidate{
+			Provider: "openlibrary", ExternalID: doc.Key, Title: doc.Title, Author: strings.Join(doc.AuthorName, ", "),
+			Publisher: firstString(doc.Publisher), PublishedAt: published, ISBN: firstISBN(doc.ISBN), Language: firstString(doc.Language), FetchedAt: fetchedAt,
+		}
+		if doc.CoverID != 0 {
+			candidate.CoverURL = fmt.Sprintf("https://covers.openlibrary.org/b/id/%d-L.jpg", doc.CoverID)
+		}
+		if candidate.ExternalID == "" {
+			candidate.ExternalID = candidate.ISBN + ":" + candidate.Title
+		}
+		candidates = append(candidates, candidate)
+	}
+	return candidates, nil
+}
+
+func firstString(values []string) string {
+	if len(values) == 0 {
+		return ""
+	}
+	return strings.TrimSpace(values[0])
+}
+
+func firstISBN(values []string) string {
+	for _, value := range values {
+		if isbn := normalizeISBN(value); isbn != "" {
+			return isbn
+		}
+	}
+	return ""
+}
+
+func (a *App) onlineMetadataCandidates(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	rows, err := a.db.QueryContext(r.Context(), `SELECT c.id, c.book_id, b.title, c.provider, c.external_id, c.title, c.author, c.publisher, c.published_at, c.isbn, c.language, c.description, c.cover_url, c.fetched_at FROM metadata_candidates c JOIN books b ON b.id = c.book_id ORDER BY c.book_id, c.id`)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+	candidates := []OnlineMetadataCandidate{}
+	for rows.Next() {
+		var candidate OnlineMetadataCandidate
+		if err := rows.Scan(&candidate.ID, &candidate.BookID, &candidate.BookTitle, &candidate.Provider, &candidate.ExternalID, &candidate.Title, &candidate.Author, &candidate.Publisher, &candidate.PublishedAt, &candidate.ISBN, &candidate.Language, &candidate.Description, &candidate.CoverURL, &candidate.FetchedAt); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		candidates = append(candidates, candidate)
+	}
+	writeJSON(w, map[string]any{"candidates": candidates, "count": len(candidates)})
+}
+
+func (a *App) applyOnlineMetadata(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var request struct {
+		CandidateIDs []int64 `json:"candidateIds"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32*1024)).Decode(&request); err != nil || len(request.CandidateIDs) == 0 {
+		http.Error(w, "select at least one metadata candidate", http.StatusBadRequest)
+		return
+	}
+	seenBooks := map[int64]bool{}
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	for _, candidateID := range request.CandidateIDs {
+		var candidate OnlineMetadataCandidate
+		if err := tx.QueryRowContext(r.Context(), `SELECT id, book_id, title, author, publisher, published_at, isbn, language, description FROM metadata_candidates WHERE id = ?`, candidateID).Scan(&candidate.ID, &candidate.BookID, &candidate.Title, &candidate.Author, &candidate.Publisher, &candidate.PublishedAt, &candidate.ISBN, &candidate.Language, &candidate.Description); err != nil {
+			_ = tx.Rollback()
+			http.Error(w, "metadata candidate is stale; fetch again", http.StatusConflict)
+			return
+		}
+		if seenBooks[candidate.BookID] {
+			_ = tx.Rollback()
+			http.Error(w, "select only one candidate per book", http.StatusBadRequest)
+			return
+		}
+		seenBooks[candidate.BookID] = true
+		if _, err := tx.ExecContext(r.Context(), `UPDATE books SET title = CASE WHEN ? != '' THEN ? ELSE title END, author = CASE WHEN ? != '' THEN ? ELSE author END WHERE id = ?`, candidate.Title, candidate.Title, candidate.Author, candidate.Author, candidate.BookID); err != nil {
+			_ = tx.Rollback()
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if _, err := tx.ExecContext(r.Context(), `INSERT INTO book_metadata (book_id, publisher, published_at, isbn, language, description, refreshed_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id) DO UPDATE SET publisher=CASE WHEN excluded.publisher != '' THEN excluded.publisher ELSE book_metadata.publisher END, published_at=CASE WHEN excluded.published_at != '' THEN excluded.published_at ELSE book_metadata.published_at END, isbn=CASE WHEN excluded.isbn != '' THEN excluded.isbn ELSE book_metadata.isbn END, language=CASE WHEN excluded.language != '' THEN excluded.language ELSE book_metadata.language END, description=CASE WHEN excluded.description != '' THEN excluded.description ELSE book_metadata.description END, refreshed_at=excluded.refreshed_at`, candidate.BookID, candidate.Publisher, candidate.PublishedAt, candidate.ISBN, candidate.Language, candidate.Description, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			_ = tx.Rollback()
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if _, err := tx.ExecContext(r.Context(), `DELETE FROM metadata_candidates WHERE book_id = ?`, candidate.BookID); err != nil {
+			_ = tx.Rollback()
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]int{"applied": len(seenBooks)})
 }
 
 func epubPackage(z *zip.ReadCloser) (*opfPackage, string, error) {

@@ -24,3 +24,5 @@ mise exec go@1.24 -- go run . -bookshelf /path/to/books -addr 127.0.0.1:8765 -db
 ```
 
 The sync indexes PDF, EPUB, CBZ, CBR, MOBI, AZW/AZW3, FB2, and TXT files. **Refresh metadata** extracts available metadata locally from EPUB/PDF files, including EPUB identifiers such as ISBN; it does not use networking. It preserves tags, notes, and reading status. Organization is optional and starts with a preview; approved moves use the human-readable `Author/Title/Title.ext` layout, refuse collisions, and can undo the latest run.
+
+**Fetch online metadata** is separate and opt-in. It queries Open Library using ISBN or title/author, stores candidates without changing books, and requires selecting the correct candidate before applying metadata.
