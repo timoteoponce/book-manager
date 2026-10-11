@@ -29,6 +29,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 	"unicode/utf16"
 
 	pdfapi "github.com/pdfcpu/pdfcpu/pkg/api"
@@ -82,6 +83,8 @@ type Book struct {
 	ISBN         string `json:"isbn,omitempty"`
 	Language     string `json:"language,omitempty"`
 	Description  string `json:"description,omitempty"`
+	Series       string `json:"series,omitempty"`
+	SeriesIndex  string `json:"seriesIndex,omitempty"`
 }
 
 type SyncResult struct {
@@ -147,8 +150,12 @@ type epubManifestItem struct {
 }
 
 type epubMeta struct {
-	Name    string `xml:"name,attr"`
-	Content string `xml:"content,attr"`
+	Name     string `xml:"name,attr"`
+	Content  string `xml:"content,attr"`
+	ID       string `xml:"id,attr"`
+	Property string `xml:"property,attr"`
+	Refines  string `xml:"refines,attr"`
+	Value    string `xml:",chardata"`
 }
 
 type extractedMetadata struct {
@@ -159,6 +166,8 @@ type extractedMetadata struct {
 	ISBN        string
 	Language    string
 	Description string
+	Series      string
+	SeriesIndex string
 }
 
 type OnlineMetadataCandidate struct {
@@ -174,6 +183,8 @@ type OnlineMetadataCandidate struct {
 	ISBN        string `json:"isbn"`
 	Language    string `json:"language"`
 	Description string `json:"description"`
+	Series      string `json:"series"`
+	SeriesIndex string `json:"seriesIndex"`
 	CoverURL    string `json:"coverUrl"`
 	FetchedAt   string `json:"fetchedAt"`
 }
@@ -188,6 +199,7 @@ type openLibrarySearch struct {
 		FirstPublishYear int      `json:"first_publish_year"`
 		ISBN             []string `json:"isbn"`
 		Language         []string `json:"language"`
+		Series           []string `json:"series"`
 		CoverID          int      `json:"cover_i"`
 	} `json:"docs"`
 }
@@ -327,6 +339,8 @@ func (a *App) initDB(ctx context.Context) error {
 			isbn TEXT NOT NULL DEFAULT '',
 			language TEXT NOT NULL DEFAULT '',
 			description TEXT NOT NULL DEFAULT '',
+			series TEXT NOT NULL DEFAULT '',
+			series_index TEXT NOT NULL DEFAULT '',
 			refreshed_at TEXT NOT NULL,
 			FOREIGN KEY(book_id) REFERENCES books(id) ON DELETE CASCADE
 		);
@@ -342,6 +356,8 @@ func (a *App) initDB(ctx context.Context) error {
 			isbn TEXT NOT NULL DEFAULT '',
 			language TEXT NOT NULL DEFAULT '',
 			description TEXT NOT NULL DEFAULT '',
+			series TEXT NOT NULL DEFAULT '',
+			series_index TEXT NOT NULL DEFAULT '',
 			cover_url TEXT NOT NULL DEFAULT '',
 			fetched_at TEXT NOT NULL,
 			UNIQUE(book_id, provider, external_id),
@@ -350,6 +366,34 @@ func (a *App) initDB(ctx context.Context) error {
 		CREATE INDEX IF NOT EXISTS metadata_candidates_book_idx ON metadata_candidates(book_id);
 	`); err != nil {
 		return err
+	}
+	for name, definition := range map[string]string{
+		"series":       "TEXT NOT NULL DEFAULT ''",
+		"series_index": "TEXT NOT NULL DEFAULT ''",
+	} {
+		var found int
+		if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('book_metadata') WHERE name = ?`, name).Scan(&found); err != nil {
+			return err
+		}
+		if found == 0 {
+			if _, err := a.db.ExecContext(ctx, `ALTER TABLE book_metadata ADD COLUMN `+name+` `+definition); err != nil {
+				return err
+			}
+		}
+	}
+	for name, definition := range map[string]string{
+		"series":       "TEXT NOT NULL DEFAULT ''",
+		"series_index": "TEXT NOT NULL DEFAULT ''",
+	} {
+		var found int
+		if err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('metadata_candidates') WHERE name = ?`, name).Scan(&found); err != nil {
+			return err
+		}
+		if found == 0 {
+			if _, err := a.db.ExecContext(ctx, `ALTER TABLE metadata_candidates ADD COLUMN `+name+` `+definition); err != nil {
+				return err
+			}
+		}
 	}
 	// These columns make upgrades safe for catalogues created by earlier builds.
 	for name, definition := range map[string]string{
@@ -926,30 +970,30 @@ func (a *App) books(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
 	status := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("status")))
-	query := `SELECT id, path, folder, filename, title, author, format, size, modified_at, status, tags, notes, last_synced_at, available FROM books`
+	query := `SELECT b.id, b.path, b.folder, b.filename, b.title, b.author, b.format, b.size, b.modified_at, b.status, b.tags, b.notes, b.last_synced_at, b.available, COALESCE(m.series, ''), COALESCE(m.series_index, '') FROM books b LEFT JOIN book_metadata m ON m.book_id = b.id`
 	args := []any{}
 	conditions := []string{}
 	if q != "" {
-		conditions = append(conditions, `(title LIKE ? OR author LIKE ? OR folder LIKE ? OR filename LIKE ? OR tags LIKE ?)`)
+		conditions = append(conditions, `(b.title LIKE ? OR b.author LIKE ? OR b.folder LIKE ? OR b.filename LIKE ? OR b.tags LIKE ? OR m.series LIKE ? OR m.series_index LIKE ?)`)
 		term := "%" + q + "%"
-		args = append(args, term, term, term, term, term)
+		args = append(args, term, term, term, term, term, term, term)
 	}
 	if format != "" {
-		conditions = append(conditions, `format = ?`)
+		conditions = append(conditions, `b.format = ?`)
 		args = append(args, format)
 	}
 	if status != "" {
 		if status == "__none__" {
-			conditions = append(conditions, `status = ''`)
+			conditions = append(conditions, `b.status = ''`)
 		} else {
-			conditions = append(conditions, `status = ?`)
+			conditions = append(conditions, `b.status = ?`)
 			args = append(args, status)
 		}
 	}
 	if len(conditions) > 0 {
 		query += " WHERE " + strings.Join(conditions, " AND ")
 	}
-	query += " ORDER BY title COLLATE NOCASE, author COLLATE NOCASE"
+	query += " ORDER BY b.title COLLATE NOCASE, b.author COLLATE NOCASE"
 	rows, err := a.db.QueryContext(r.Context(), query, args...)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -960,7 +1004,7 @@ func (a *App) books(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var book Book
 		var available int
-		if err := rows.Scan(&book.ID, &book.Path, &book.Folder, &book.Filename, &book.Title, &book.Author, &book.Format, &book.Size, &book.ModifiedAt, &book.Status, &book.Tags, &book.Notes, &book.LastSyncedAt, &available); err != nil {
+		if err := rows.Scan(&book.ID, &book.Path, &book.Folder, &book.Filename, &book.Title, &book.Author, &book.Format, &book.Size, &book.ModifiedAt, &book.Status, &book.Tags, &book.Notes, &book.LastSyncedAt, &available, &book.Series, &book.SeriesIndex); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -1028,7 +1072,7 @@ func (a *App) book(w http.ResponseWriter, r *http.Request) {
 }
 
 func (a *App) loadBookMetadata(ctx context.Context, book *Book) error {
-	err := a.db.QueryRowContext(ctx, `SELECT publisher, published_at, isbn, language, description FROM book_metadata WHERE book_id = ?`, book.ID).Scan(&book.Publisher, &book.PublishedAt, &book.ISBN, &book.Language, &book.Description)
+	err := a.db.QueryRowContext(ctx, `SELECT publisher, published_at, isbn, language, description, series, series_index FROM book_metadata WHERE book_id = ?`, book.ID).Scan(&book.Publisher, &book.PublishedAt, &book.ISBN, &book.Language, &book.Description, &book.Series, &book.SeriesIndex)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
@@ -1586,6 +1630,10 @@ func extractMetadata(path, format string) (extractedMetadata, error) {
 			Title: pkg.Metadata.Title, Author: pkg.Metadata.Creator, Publisher: pkg.Metadata.Publisher,
 			PublishedAt: pkg.Metadata.Date, Language: pkg.Metadata.Language, Description: pkg.Metadata.Description,
 		}
+		metadata.Series, metadata.SeriesIndex = epubSeriesMetadata(pkg)
+		if metadata.Series == "" {
+			metadata.Series, metadata.SeriesIndex = seriesFromFilename(path)
+		}
 		for _, identifier := range pkg.Metadata.Identifiers {
 			if isbn := normalizeISBN(identifier.Value); isbn != "" {
 				metadata.ISBN = isbn
@@ -1599,6 +1647,100 @@ func extractMetadata(path, format string) (extractedMetadata, error) {
 	default:
 		return extractedMetadata{}, nil
 	}
+}
+
+func seriesFromFilename(path string) (string, string) {
+	base := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+	parent := filepath.Base(filepath.Dir(path))
+	index := ""
+	name := ""
+	if match := volumePattern.FindStringSubmatch(base); len(match) == 3 {
+		name = strings.TrimSpace(match[1])
+		index = match[2]
+	}
+	candidate := name
+	if candidate == "" {
+		candidate = base
+	}
+	if _, after, found := strings.Cut(candidate, " - "); found && strings.TrimSpace(after) != "" {
+		candidate = after
+	}
+	if len(parent) > 3 && folderMatchesFilename(parent, candidate) {
+		return parent, index
+	}
+	if index != "" {
+		return name, index
+	}
+	return "", ""
+}
+
+var volumePattern = regexp.MustCompile(`(?i)^(.*?)(?:,?\s*vol(?:ume)?\.?\s*|\s+v)(\d+)$`)
+
+func folderMatchesFilename(folder, filename string) bool {
+	left, right := normalizeName(folder), normalizeName(filename)
+	if left == "" || right == "" {
+		return false
+	}
+	return strings.HasPrefix(right, left) || strings.HasPrefix(left, right) ||
+		strings.HasPrefix(right+"s", left) || strings.HasPrefix(left+"s", right)
+}
+
+func meaningfulTitle(title string) bool {
+	trimmed := strings.TrimSpace(title)
+	if trimmed == "" {
+		return false
+	}
+	alphanumeric := 0
+	for _, character := range trimmed {
+		if unicode.IsLetter(character) || unicode.IsDigit(character) {
+			alphanumeric++
+		}
+	}
+	// Comic archives frequently carry placeholder titles such as "0 (2)".
+	return alphanumeric >= 4
+}
+
+func normalizeName(value string) string {
+	var builder strings.Builder
+	for _, character := range strings.ToLower(value) {
+		if unicode.IsLetter(character) || unicode.IsDigit(character) {
+			builder.WriteRune(character)
+		}
+	}
+	return builder.String()
+}
+
+func epubSeriesMetadata(pkg *opfPackage) (string, string) {
+	series, index := "", ""
+	collections := map[string]string{}
+	seriesCollections := map[string]bool{}
+	for _, item := range pkg.Metadata.Items {
+		name := strings.ToLower(item.Name)
+		if name == "calibre:series" {
+			series = strings.TrimSpace(item.Content)
+		} else if name == "calibre:series_index" {
+			index = strings.TrimSpace(item.Content)
+		}
+		property := strings.ToLower(item.Property)
+		if property == "belongs-to-collection" {
+			collections[item.ID] = strings.TrimSpace(item.Value)
+		} else if property == "collection-type" && strings.EqualFold(strings.TrimSpace(item.Value), "series") {
+			seriesCollections[strings.TrimPrefix(item.Refines, "#")] = true
+		} else if property == "group-position" {
+			if series == "" {
+				index = strings.TrimSpace(item.Value)
+			}
+		}
+	}
+	if series == "" {
+		for id, value := range collections {
+			if seriesCollections[id] || len(seriesCollections) == 0 {
+				series = value
+				break
+			}
+		}
+	}
+	return series, index
 }
 
 func normalizeISBN(value string) string {
@@ -1636,8 +1778,9 @@ func consolidateBookMetadata(ctx context.Context, id int64, db *sql.DB, bookshel
 	}
 	metadata := extractedMetadata{Title: title, Author: author}
 	var publisher, publishedAt, isbn, language, description string
-	if err := db.QueryRowContext(ctx, `SELECT publisher, published_at, isbn, language, description FROM book_metadata WHERE book_id = ?`, id).Scan(&publisher, &publishedAt, &isbn, &language, &description); err == nil {
-		metadata.Publisher, metadata.PublishedAt, metadata.ISBN, metadata.Language, metadata.Description = publisher, publishedAt, isbn, language, description
+	var series, seriesIndex string
+	if err := db.QueryRowContext(ctx, `SELECT publisher, published_at, isbn, language, description, series, series_index FROM book_metadata WHERE book_id = ?`, id).Scan(&publisher, &publishedAt, &isbn, &language, &description, &series, &seriesIndex); err == nil {
+		metadata.Publisher, metadata.PublishedAt, metadata.ISBN, metadata.Language, metadata.Description, metadata.Series, metadata.SeriesIndex = publisher, publishedAt, isbn, language, description, series, seriesIndex
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
@@ -1737,7 +1880,9 @@ func metadataDiffers(current, desired extractedMetadata) bool {
 		(desired.PublishedAt != "" && current.PublishedAt != desired.PublishedAt) ||
 		(desired.ISBN != "" && current.ISBN != desired.ISBN) ||
 		(desired.Language != "" && current.Language != desired.Language) ||
-		(desired.Description != "" && current.Description != desired.Description)
+		(desired.Description != "" && current.Description != desired.Description) ||
+		(desired.Series != "" && current.Series != desired.Series) ||
+		(desired.SeriesIndex != "" && current.SeriesIndex != desired.SeriesIndex)
 }
 
 func updateOPFMetadata(data []byte, metadata extractedMetadata) []byte {
@@ -1858,7 +2003,7 @@ func (a *App) searchBookMetadata(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	for _, match := range matches {
-		if _, err := a.db.ExecContext(r.Context(), `INSERT INTO metadata_candidates (book_id, provider, external_id, title, author, publisher, published_at, isbn, language, description, cover_url, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id, provider, external_id) DO UPDATE SET title=excluded.title, author=excluded.author, publisher=excluded.publisher, published_at=excluded.published_at, isbn=excluded.isbn, language=excluded.language, description=excluded.description, cover_url=excluded.cover_url, fetched_at=excluded.fetched_at`, request.BookID, match.Provider, match.ExternalID, match.Title, match.Author, match.Publisher, match.PublishedAt, match.ISBN, match.Language, match.Description, match.CoverURL, match.FetchedAt); err != nil {
+		if _, err := a.db.ExecContext(r.Context(), `INSERT INTO metadata_candidates (book_id, provider, external_id, title, author, publisher, published_at, isbn, language, description, series, series_index, cover_url, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id, provider, external_id) DO UPDATE SET title=excluded.title, author=excluded.author, publisher=excluded.publisher, published_at=excluded.published_at, isbn=excluded.isbn, language=excluded.language, description=excluded.description, series=excluded.series, series_index=excluded.series_index, cover_url=excluded.cover_url, fetched_at=excluded.fetched_at`, request.BookID, match.Provider, match.ExternalID, match.Title, match.Author, match.Publisher, match.PublishedAt, match.ISBN, match.Language, match.Description, match.Series, match.SeriesIndex, match.CoverURL, match.FetchedAt); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -1894,19 +2039,31 @@ func (a *App) refreshMetadataJob(ctx context.Context) (int, int, error) {
 	a.setMetadataTotal(len(files))
 	refreshed, failed := 0, 0
 	for index, file := range files {
-		metadata, err := extractMetadata(filepath.Join(a.bookshelf, filepath.FromSlash(file.path)), file.format)
+		fullPath := filepath.Join(a.bookshelf, filepath.FromSlash(file.path))
+		metadata, err := extractMetadata(fullPath, file.format)
 		if err != nil {
 			failed++
 			a.setMetadataProgress(index+1, failed)
 			continue
 		}
+		if !meaningfulTitle(metadata.Title) {
+			if fallbackTitle, fallbackAuthor := displayMetadata(filepath.Base(fullPath)); meaningfulTitle(fallbackTitle) {
+				metadata.Title = fallbackTitle
+				if metadata.Author == "" {
+					metadata.Author = fallbackAuthor
+				}
+			}
+		}
+		if metadata.Series == "" {
+			metadata.Series, metadata.SeriesIndex = seriesFromFilename(fullPath)
+		}
 		if _, err = a.db.ExecContext(ctx, `UPDATE books SET title = CASE WHEN ? != '' THEN ? ELSE title END, author = CASE WHEN ? != '' THEN ? ELSE author END WHERE id = ?`, metadata.Title, metadata.Title, metadata.Author, metadata.Author, file.id); err != nil {
 			return refreshed, failed, err
 		}
-		if _, err = a.db.ExecContext(ctx, `INSERT INTO book_metadata (book_id, publisher, published_at, isbn, language, description, refreshed_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id) DO UPDATE SET publisher=excluded.publisher, published_at=excluded.published_at, isbn=excluded.isbn, language=excluded.language, description=excluded.description, refreshed_at=excluded.refreshed_at`, file.id, metadata.Publisher, metadata.PublishedAt, metadata.ISBN, metadata.Language, metadata.Description, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if _, err = a.db.ExecContext(ctx, `INSERT INTO book_metadata (book_id, publisher, published_at, isbn, language, description, series, series_index, refreshed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id) DO UPDATE SET publisher=CASE WHEN excluded.publisher != '' THEN excluded.publisher ELSE book_metadata.publisher END, published_at=CASE WHEN excluded.published_at != '' THEN excluded.published_at ELSE book_metadata.published_at END, isbn=CASE WHEN excluded.isbn != '' THEN excluded.isbn ELSE book_metadata.isbn END, language=CASE WHEN excluded.language != '' THEN excluded.language ELSE book_metadata.language END, description=CASE WHEN excluded.description != '' THEN excluded.description ELSE book_metadata.description END, series=CASE WHEN excluded.series != '' THEN excluded.series ELSE book_metadata.series END, series_index=CASE WHEN excluded.series_index != '' THEN excluded.series_index ELSE book_metadata.series_index END, refreshed_at=excluded.refreshed_at`, file.id, metadata.Publisher, metadata.PublishedAt, metadata.ISBN, metadata.Language, metadata.Description, metadata.Series, metadata.SeriesIndex, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			return refreshed, failed, err
 		}
-		if err := consolidateMetadata(filepath.Join(a.bookshelf, filepath.FromSlash(file.path)), file.format, metadata); err != nil {
+		if err := consolidateMetadata(fullPath, file.format, metadata); err != nil {
 			return refreshed, failed, err
 		}
 		refreshed++
@@ -1954,7 +2111,7 @@ func (a *App) fetchOnlineMetadataJob(ctx context.Context) (int, int, int, error)
 			return len(lookups), fetched, failed, err
 		}
 		for _, match := range matches {
-			_, err := a.db.ExecContext(ctx, `INSERT INTO metadata_candidates (book_id, provider, external_id, title, author, publisher, published_at, isbn, language, description, cover_url, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id, provider, external_id) DO UPDATE SET title=excluded.title, author=excluded.author, publisher=excluded.publisher, published_at=excluded.published_at, isbn=excluded.isbn, language=excluded.language, description=excluded.description, cover_url=excluded.cover_url, fetched_at=excluded.fetched_at`, item.id, match.Provider, match.ExternalID, match.Title, match.Author, match.Publisher, match.PublishedAt, match.ISBN, match.Language, match.Description, match.CoverURL, match.FetchedAt)
+			_, err := a.db.ExecContext(ctx, `INSERT INTO metadata_candidates (book_id, provider, external_id, title, author, publisher, published_at, isbn, language, description, series, series_index, cover_url, fetched_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id, provider, external_id) DO UPDATE SET title=excluded.title, author=excluded.author, publisher=excluded.publisher, published_at=excluded.published_at, isbn=excluded.isbn, language=excluded.language, description=excluded.description, series=excluded.series, series_index=excluded.series_index, cover_url=excluded.cover_url, fetched_at=excluded.fetched_at`, item.id, match.Provider, match.ExternalID, match.Title, match.Author, match.Publisher, match.PublishedAt, match.ISBN, match.Language, match.Description, match.Series, match.SeriesIndex, match.CoverURL, match.FetchedAt)
 			if err != nil {
 				return len(lookups), fetched, failed, err
 			}
@@ -2003,7 +2160,7 @@ func openLibraryLookup(ctx context.Context, client *http.Client, title, author, 
 		}
 		candidate := OnlineMetadataCandidate{
 			Provider: "openlibrary", ExternalID: doc.Key, Title: doc.Title, Author: strings.Join(doc.AuthorName, ", "),
-			Publisher: firstString(doc.Publisher), PublishedAt: published, ISBN: firstISBN(doc.ISBN), Language: firstString(doc.Language), FetchedAt: fetchedAt,
+			Publisher: firstString(doc.Publisher), PublishedAt: published, ISBN: firstISBN(doc.ISBN), Language: firstString(doc.Language), Series: firstString(doc.Series), FetchedAt: fetchedAt,
 		}
 		if doc.CoverID != 0 {
 			candidate.CoverURL = fmt.Sprintf("https://covers.openlibrary.org/b/id/%d-L.jpg", doc.CoverID)
@@ -2037,7 +2194,7 @@ func (a *App) onlineMetadataCandidates(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	rows, err := a.db.QueryContext(r.Context(), `SELECT c.id, c.book_id, b.title, c.provider, c.external_id, c.title, c.author, c.publisher, c.published_at, c.isbn, c.language, c.description, c.cover_url, c.fetched_at FROM metadata_candidates c JOIN books b ON b.id = c.book_id ORDER BY c.book_id, c.id`)
+	rows, err := a.db.QueryContext(r.Context(), `SELECT c.id, c.book_id, b.title, c.provider, c.external_id, c.title, c.author, c.publisher, c.published_at, c.isbn, c.language, c.description, c.series, c.series_index, c.cover_url, c.fetched_at FROM metadata_candidates c JOIN books b ON b.id = c.book_id ORDER BY c.book_id, c.id`)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -2046,7 +2203,7 @@ func (a *App) onlineMetadataCandidates(w http.ResponseWriter, r *http.Request) {
 	candidates := []OnlineMetadataCandidate{}
 	for rows.Next() {
 		var candidate OnlineMetadataCandidate
-		if err := rows.Scan(&candidate.ID, &candidate.BookID, &candidate.BookTitle, &candidate.Provider, &candidate.ExternalID, &candidate.Title, &candidate.Author, &candidate.Publisher, &candidate.PublishedAt, &candidate.ISBN, &candidate.Language, &candidate.Description, &candidate.CoverURL, &candidate.FetchedAt); err != nil {
+		if err := rows.Scan(&candidate.ID, &candidate.BookID, &candidate.BookTitle, &candidate.Provider, &candidate.ExternalID, &candidate.Title, &candidate.Author, &candidate.Publisher, &candidate.PublishedAt, &candidate.ISBN, &candidate.Language, &candidate.Description, &candidate.Series, &candidate.SeriesIndex, &candidate.CoverURL, &candidate.FetchedAt); err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -2076,7 +2233,7 @@ func (a *App) applyOnlineMetadata(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, candidateID := range request.CandidateIDs {
 		var candidate OnlineMetadataCandidate
-		if err := tx.QueryRowContext(r.Context(), `SELECT id, book_id, title, author, publisher, published_at, isbn, language, description FROM metadata_candidates WHERE id = ?`, candidateID).Scan(&candidate.ID, &candidate.BookID, &candidate.Title, &candidate.Author, &candidate.Publisher, &candidate.PublishedAt, &candidate.ISBN, &candidate.Language, &candidate.Description); err != nil {
+		if err := tx.QueryRowContext(r.Context(), `SELECT id, book_id, title, author, publisher, published_at, isbn, language, description, series, series_index FROM metadata_candidates WHERE id = ?`, candidateID).Scan(&candidate.ID, &candidate.BookID, &candidate.Title, &candidate.Author, &candidate.Publisher, &candidate.PublishedAt, &candidate.ISBN, &candidate.Language, &candidate.Description, &candidate.Series, &candidate.SeriesIndex); err != nil {
 			_ = tx.Rollback()
 			http.Error(w, "metadata candidate is stale; fetch again", http.StatusConflict)
 			return
@@ -2093,7 +2250,7 @@ func (a *App) applyOnlineMetadata(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		if _, err := tx.ExecContext(r.Context(), `INSERT INTO book_metadata (book_id, publisher, published_at, isbn, language, description, refreshed_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id) DO UPDATE SET publisher=CASE WHEN excluded.publisher != '' THEN excluded.publisher ELSE book_metadata.publisher END, published_at=CASE WHEN excluded.published_at != '' THEN excluded.published_at ELSE book_metadata.published_at END, isbn=CASE WHEN excluded.isbn != '' THEN excluded.isbn ELSE book_metadata.isbn END, language=CASE WHEN excluded.language != '' THEN excluded.language ELSE book_metadata.language END, description=CASE WHEN excluded.description != '' THEN excluded.description ELSE book_metadata.description END, refreshed_at=excluded.refreshed_at`, candidate.BookID, candidate.Publisher, candidate.PublishedAt, candidate.ISBN, candidate.Language, candidate.Description, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		if _, err := tx.ExecContext(r.Context(), `INSERT INTO book_metadata (book_id, publisher, published_at, isbn, language, description, series, series_index, refreshed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id) DO UPDATE SET publisher=CASE WHEN excluded.publisher != '' THEN excluded.publisher ELSE book_metadata.publisher END, published_at=CASE WHEN excluded.published_at != '' THEN excluded.published_at ELSE book_metadata.published_at END, isbn=CASE WHEN excluded.isbn != '' THEN excluded.isbn ELSE book_metadata.isbn END, language=CASE WHEN excluded.language != '' THEN excluded.language ELSE book_metadata.language END, description=CASE WHEN excluded.description != '' THEN excluded.description ELSE book_metadata.description END, series=CASE WHEN excluded.series != '' THEN excluded.series ELSE book_metadata.series END, series_index=CASE WHEN excluded.series_index != '' THEN excluded.series_index ELSE book_metadata.series_index END, refreshed_at=excluded.refreshed_at`, candidate.BookID, candidate.Publisher, candidate.PublishedAt, candidate.ISBN, candidate.Language, candidate.Description, candidate.Series, candidate.SeriesIndex, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
 			_ = tx.Rollback()
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return

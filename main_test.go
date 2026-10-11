@@ -193,6 +193,113 @@ func TestEPUBMetadataExtractsIdentifierAndPublicationData(t *testing.T) {
 	}
 }
 
+func TestEPUBMetadataExtractsCalibreSeries(t *testing.T) {
+	path := writeTestEPUB(t, `<package><metadata><title>My Hero Academia Vigilantes, Vol 3</title><creator>Hideyuki Furuhashi</creator><meta name="calibre:series" content="My Hero Academia: Vigilantes"/><meta name="calibre:series_index" content="3"/></metadata></package>`)
+	metadata, err := extractMetadata(path, "epub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Series != "My Hero Academia: Vigilantes" || metadata.SeriesIndex != "3" {
+		t.Fatalf("series = %q index = %q", metadata.Series, metadata.SeriesIndex)
+	}
+}
+
+func TestEPUBMetadataExtractsEPUB3SeriesCollection(t *testing.T) {
+	path := writeTestEPUB(t, `<package><metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><meta property="belongs-to-collection" id="c01">My Hero Academia: Vigilantes</meta><meta property="collection-type" refines="#c01">series</meta><meta property="group-position" refines="#c01">3</meta></metadata></package>`)
+	metadata, err := extractMetadata(path, "epub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if metadata.Series != "My Hero Academia: Vigilantes" || metadata.SeriesIndex != "3" {
+		t.Fatalf("series = %q index = %q", metadata.Series, metadata.SeriesIndex)
+	}
+}
+
+func TestSeriesFallsBackToFilenameAndFolder(t *testing.T) {
+	directory := filepath.Join(t.TempDir(), "My Hero Academia Vigilantes")
+	if err := os.MkdirAll(directory, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !meaningfulTitle("My Hero Academia Vigilantes") || meaningfulTitle("0 (2)") || meaningfulTitle("") {
+		t.Fatal("meaningfulTitle rejected or accepted the wrong values")
+	}
+	series, index := seriesFromFilename(filepath.Join(directory, "Kohei Horikoshi - My Hero Academia Vigilantes, Vol 7.epub"))
+	if series != "My Hero Academia Vigilantes" || index != "7" {
+		t.Fatalf("folder series = %q index = %q", series, index)
+	}
+	series, index = seriesFromFilename(filepath.Join(directory, "My Hero Academia Vigilantes Vol 1.epub"))
+	if series != "My Hero Academia Vigilantes" || index != "1" {
+		t.Fatalf("bare folder series = %q index = %q", series, index)
+	}
+	series, index = seriesFromFilename(filepath.Join(directory, "Kohei Horikoshi - My Hero Academia, Vigilante, Vol 6.cbz"))
+	if series != "My Hero Academia Vigilantes" || index != "6" {
+		t.Fatalf("singular folder series = %q index = %q", series, index)
+	}
+	series, index = seriesFromFilename(filepath.Join(t.TempDir(), "Some Book, Volume 12.epub"))
+	if series != "Some Book" || index != "12" {
+		t.Fatalf("filename series = %q index = %q", series, index)
+	}
+}
+
+func TestSearchMatchesSeriesMetadata(t *testing.T) {
+	bookshelf := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bookshelf, "Author - Book.epub"), []byte("not a zip"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:series-search-test?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	app := &App{db: db, bookshelf: bookshelf}
+	if err := app.initDB(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO book_metadata (book_id, publisher, published_at, isbn, language, description, series, series_index, refreshed_at) SELECT id, '', '', '', '', '', 'My Hero Academia Vigilantes', '7', '' FROM books`); err != nil {
+		t.Fatal(err)
+	}
+	request := httptest.NewRequest("GET", "/api/books?q=vigilantes", nil)
+	response := httptest.NewRecorder()
+	app.books(response, request)
+	if response.Code != 200 || !bytes.Contains(response.Body.Bytes(), []byte("My Hero Academia Vigilantes")) {
+		t.Fatalf("series search status = %d body = %s", response.Code, response.Body.String())
+	}
+}
+
+func writeTestEPUB(t *testing.T, opf string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "book.epub")
+	file, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archive := zip.NewWriter(file)
+	entries := map[string]string{
+		"META-INF/container.xml": `<?xml version="1.0"?><container><rootfiles><rootfile full-path="content.opf"/></rootfiles></container>`,
+		"content.opf":            opf,
+	}
+	for name, content := range entries {
+		writer, err := archive.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write([]byte(content)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func TestPDFMetadataReadsInfoDictionary(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "book.pdf")
 	if err := os.WriteFile(path, []byte("7 0 obj << /Title (A PDF Title) /Author (Jane Doe) >> endobj"), 0o644); err != nil {

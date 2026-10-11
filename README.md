@@ -16,6 +16,8 @@ Implemented:
 - Non-destructive sync that preserves unavailable records and user metadata.
 - Search by title, author, folder, filename, tags, format, and reading status.
 - EPUB covers and locally extracted EPUB/PDF metadata.
+- Series and series index from EPUB metadata (Calibre and EPUB 3 collections) with filename/folder fallback.
+- Rejection of placeholder titles such as `0 (2)` in favour of the filename-derived title.
 - PDF metadata decoding including escaped UTF-16 and octal strings.
 - Editable tags, notes, and reading status.
 - Metadata consolidation into supported EPUB and PDF files using atomic replacement.
