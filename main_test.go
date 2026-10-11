@@ -181,6 +181,16 @@ func TestEPUBMetadataExtractsIdentifierAndPublicationData(t *testing.T) {
 	if metadata.Title != "A Book" || metadata.Author != "Jane Doe" || metadata.Publisher != "Example Press" || metadata.PublishedAt != "2024-01-02" || metadata.ISBN != "9780306406157" {
 		t.Fatalf("metadata = %#v", metadata)
 	}
+	if err := consolidateMetadata(path, "epub", extractedMetadata{Title: "Updated Book", Author: "New Author", Publisher: "New Press", PublishedAt: "2025", ISBN: "9783161484100", Language: "es"}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := extractMetadata(path, "epub")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Title != "Updated Book" || updated.Author != "New Author" || updated.Publisher != "New Press" || updated.PublishedAt != "2025" || updated.ISBN != "9783161484100" || updated.Language != "es" {
+		t.Fatalf("updated metadata = %#v", updated)
+	}
 }
 
 func TestPDFMetadataReadsInfoDictionary(t *testing.T) {

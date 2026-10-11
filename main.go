@@ -31,6 +31,9 @@ import (
 	"time"
 	"unicode/utf16"
 
+	pdfapi "github.com/pdfcpu/pdfcpu/pkg/api"
+	pdfmodel "github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
+
 	_ "modernc.org/sqlite"
 )
 
@@ -246,6 +249,7 @@ func main() {
 	mux.HandleFunc("/api/cleanup/candidates", app.cleanupCandidatesHandler)
 	mux.HandleFunc("/api/cleanup/forget/", app.forgetCleanupRecord)
 	mux.HandleFunc("/api/cleanup/delete", app.deleteCleanupCandidates)
+	mux.HandleFunc("/api/books/delete", app.deleteBooks)
 	mux.HandleFunc("/api/metadata/refresh", app.refreshMetadata)
 	mux.HandleFunc("/api/metadata/fetch-online", app.fetchOnlineMetadata)
 	mux.HandleFunc("/api/metadata/search", app.searchBookMetadata)
@@ -435,6 +439,9 @@ func (a *App) syncUnlocked(ctx context.Context) (SyncResult, error) {
 						author = pdfAuthor
 					}
 				}
+			}
+			if err := consolidateMetadata(path, strings.TrimPrefix(ext, "."), extractedMetadata{Title: title, Author: author}); err != nil {
+				log.Printf("metadata consolidation skipped for %s: %v", path, err)
 			}
 		}
 		found = append(found, foundBook{
@@ -846,6 +853,75 @@ func (a *App) deleteCleanupCandidates(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"deleted": len(moves), "forgotten": len(deleteIDs) - len(moves), "trashRun": runID})
 }
 
+func (a *App) deleteBooks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var request struct {
+		IDs []int64 `json:"ids"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 32*1024)).Decode(&request); err != nil || len(request.IDs) == 0 {
+		http.Error(w, "select at least one book", http.StatusBadRequest)
+		return
+	}
+	runID := time.Now().UTC().Format("20060102T150405.000000000Z")
+	moves := []organizationMove{}
+	seen := map[int64]bool{}
+	for _, id := range request.IDs {
+		if seen[id] {
+			continue
+		}
+		seen[id] = true
+		var relative string
+		var available int
+		if err := a.db.QueryRowContext(r.Context(), `SELECT path, available FROM books WHERE id = ?`, id).Scan(&relative, &available); err != nil || available != 1 {
+			a.rollbackOrganizationMoves(moves)
+			http.Error(w, "book selection is stale; refresh the catalogue", http.StatusConflict)
+			return
+		}
+		source := filepath.Join(a.bookshelf, filepath.FromSlash(relative))
+		trashRelative := filepath.ToSlash(filepath.Join(".book-manager", "trash", runID, filepath.FromSlash(relative)))
+		trashPath := filepath.Join(a.bookshelf, filepath.FromSlash(trashRelative))
+		if _, err := os.Stat(source); err != nil {
+			a.rollbackOrganizationMoves(moves)
+			http.Error(w, "book file is unavailable; sync first", http.StatusConflict)
+			return
+		}
+		if err := os.MkdirAll(filepath.Dir(trashPath), 0o755); err != nil {
+			a.rollbackOrganizationMoves(moves)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if err := os.Rename(source, trashPath); err != nil {
+			a.rollbackOrganizationMoves(moves)
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		moves = append(moves, organizationMove{Original: relative, New: trashRelative})
+	}
+	tx, err := a.db.BeginTx(r.Context(), nil)
+	if err == nil {
+		for id := range seen {
+			if _, err = tx.ExecContext(r.Context(), `DELETE FROM books WHERE id = ?`, id); err != nil {
+				break
+			}
+		}
+	}
+	if err == nil {
+		err = tx.Commit()
+	}
+	if err != nil {
+		if tx != nil {
+			_ = tx.Rollback()
+		}
+		a.rollbackOrganizationMoves(moves)
+		http.Error(w, "delete rolled back: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]any{"deleted": len(moves), "trashRun": runID})
+}
+
 func (a *App) books(w http.ResponseWriter, r *http.Request) {
 	q := strings.TrimSpace(r.URL.Query().Get("q"))
 	format := strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
@@ -977,6 +1053,10 @@ func (a *App) updateBook(w http.ResponseWriter, r *http.Request, id int64) {
 	}
 	if _, err := a.db.ExecContext(r.Context(), `UPDATE books SET status = ?, tags = ?, notes = ? WHERE id = ?`, input.Status, strings.TrimSpace(input.Tags), strings.TrimSpace(input.Notes), id); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := consolidateBookMetadata(r.Context(), id, a.db, a.bookshelf); err != nil {
+		http.Error(w, "metadata saved locally but could not be copied into the book file: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	writeJSON(w, map[string]string{"status": "saved"})
@@ -1535,6 +1615,177 @@ func normalizeISBN(value string) string {
 	return ""
 }
 
+func consolidateMetadata(path, format string, metadata extractedMetadata) error {
+	if metadata.Title == "" && metadata.Author == "" && metadata.Publisher == "" && metadata.PublishedAt == "" && metadata.ISBN == "" && metadata.Language == "" && metadata.Description == "" {
+		return nil
+	}
+	switch format {
+	case "epub":
+		return consolidateEPUB(path, metadata)
+	case "pdf":
+		return consolidatePDF(path, metadata)
+	default:
+		return nil
+	}
+}
+
+func consolidateBookMetadata(ctx context.Context, id int64, db *sql.DB, bookshelf string) error {
+	var path, format, title, author string
+	if err := db.QueryRowContext(ctx, `SELECT path, format, title, author FROM books WHERE id = ? AND available = 1`, id).Scan(&path, &format, &title, &author); err != nil {
+		return err
+	}
+	metadata := extractedMetadata{Title: title, Author: author}
+	var publisher, publishedAt, isbn, language, description string
+	if err := db.QueryRowContext(ctx, `SELECT publisher, published_at, isbn, language, description FROM book_metadata WHERE book_id = ?`, id).Scan(&publisher, &publishedAt, &isbn, &language, &description); err == nil {
+		metadata.Publisher, metadata.PublishedAt, metadata.ISBN, metadata.Language, metadata.Description = publisher, publishedAt, isbn, language, description
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	return consolidateMetadata(filepath.Join(bookshelf, filepath.FromSlash(path)), format, metadata)
+}
+
+func consolidatePDF(path string, metadata extractedMetadata) error {
+	properties := map[string]string{}
+	if metadata.Title != "" {
+		properties["Title"] = metadata.Title
+	}
+	if metadata.Author != "" {
+		properties["Author"] = metadata.Author
+	}
+	if metadata.Description != "" {
+		properties["Subject"] = metadata.Description
+	}
+	if len(properties) == 0 {
+		return nil
+	}
+	currentTitle, currentAuthor := pdfMetadata(path)
+	if currentTitle == metadata.Title && currentAuthor == metadata.Author {
+		return nil
+	}
+	return atomicRewrite(path, func(tempPath string) error {
+		return pdfapi.AddPropertiesFile(path, tempPath, properties, pdfmodel.NewDefaultConfiguration())
+	})
+}
+
+func consolidateEPUB(path string, metadata extractedMetadata) error {
+	current, err := extractMetadata(path, "epub")
+	if err != nil {
+		return err
+	}
+	if !metadataDiffers(current, metadata) {
+		return nil
+	}
+	archive, err := zip.OpenReader(path)
+	if err != nil {
+		return err
+	}
+	defer archive.Close()
+	_, opfPath, err := epubPackage(archive)
+	if err != nil {
+		return err
+	}
+	return atomicRewrite(path, func(tempPath string) error {
+		output, err := os.Create(tempPath)
+		if err != nil {
+			return err
+		}
+		writer := zip.NewWriter(output)
+		for _, entry := range archive.File {
+			reader, err := entry.Open()
+			if err != nil {
+				_ = writer.Close()
+				_ = output.Close()
+				return err
+			}
+			data, err := io.ReadAll(reader)
+			_ = reader.Close()
+			if err != nil {
+				_ = writer.Close()
+				_ = output.Close()
+				return err
+			}
+			if filepath.ToSlash(entry.Name) == opfPath {
+				data = updateOPFMetadata(data, metadata)
+			}
+			header := entry.FileHeader
+			header.Name = entry.Name
+			header.Method = entry.Method
+			destination, err := writer.CreateHeader(&header)
+			if err != nil {
+				_ = writer.Close()
+				_ = output.Close()
+				return err
+			}
+			if _, err := destination.Write(data); err != nil {
+				_ = writer.Close()
+				_ = output.Close()
+				return err
+			}
+		}
+		if err := writer.Close(); err != nil {
+			_ = output.Close()
+			return err
+		}
+		return output.Close()
+	})
+}
+
+func metadataDiffers(current, desired extractedMetadata) bool {
+	return (desired.Title != "" && current.Title != desired.Title) ||
+		(desired.Author != "" && current.Author != desired.Author) ||
+		(desired.Publisher != "" && current.Publisher != desired.Publisher) ||
+		(desired.PublishedAt != "" && current.PublishedAt != desired.PublishedAt) ||
+		(desired.ISBN != "" && current.ISBN != desired.ISBN) ||
+		(desired.Language != "" && current.Language != desired.Language) ||
+		(desired.Description != "" && current.Description != desired.Description)
+}
+
+func updateOPFMetadata(data []byte, metadata extractedMetadata) []byte {
+	text := string(data)
+	values := map[string]string{"title": metadata.Title, "creator": metadata.Author, "publisher": metadata.Publisher, "date": metadata.PublishedAt, "language": metadata.Language, "description": metadata.Description, "identifier": metadata.ISBN}
+	for tag, value := range values {
+		if value == "" {
+			continue
+		}
+		escaped := string(xmlEscape(value))
+		pattern := regexp.MustCompile(`(?s)(<(?:(?:[A-Za-z0-9_-]+:)?` + tag + `)\b[^>]*>).*?(</(?:(?:[A-Za-z0-9_-]+:)?` + tag + `)\s*>)`)
+		if pattern.MatchString(text) {
+			text = pattern.ReplaceAllStringFunc(text, func(match string) string {
+				parts := pattern.FindStringSubmatch(match)
+				return parts[1] + escaped + parts[2]
+			})
+		} else if index := strings.Index(strings.ToLower(text), "</metadata>"); index >= 0 {
+			element := "<" + tag + ">" + escaped + "</" + tag + ">"
+			text = text[:index] + element + text[index:]
+		}
+	}
+	return []byte(text)
+}
+
+func xmlEscape(value string) []byte {
+	var buffer bytes.Buffer
+	_ = xml.EscapeText(&buffer, []byte(value))
+	return buffer.Bytes()
+}
+
+func atomicRewrite(path string, rewrite func(string) error) error {
+	directory := filepath.Dir(path)
+	temp, err := os.CreateTemp(directory, ".book-manager-metadata-*")
+	if err != nil {
+		return err
+	}
+	tempPath := temp.Name()
+	if err := temp.Close(); err != nil {
+		_ = os.Remove(tempPath)
+		return err
+	}
+	defer os.Remove(tempPath)
+	if err := rewrite(tempPath); err != nil {
+		return err
+	}
+	return os.Rename(tempPath, path)
+}
+
 func (a *App) refreshMetadata(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1653,6 +1904,9 @@ func (a *App) refreshMetadataJob(ctx context.Context) (int, int, error) {
 			return refreshed, failed, err
 		}
 		if _, err = a.db.ExecContext(ctx, `INSERT INTO book_metadata (book_id, publisher, published_at, isbn, language, description, refreshed_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id) DO UPDATE SET publisher=excluded.publisher, published_at=excluded.published_at, isbn=excluded.isbn, language=excluded.language, description=excluded.description, refreshed_at=excluded.refreshed_at`, file.id, metadata.Publisher, metadata.PublishedAt, metadata.ISBN, metadata.Language, metadata.Description, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+			return refreshed, failed, err
+		}
+		if err := consolidateMetadata(filepath.Join(a.bookshelf, filepath.FromSlash(file.path)), file.format, metadata); err != nil {
 			return refreshed, failed, err
 		}
 		refreshed++
@@ -1814,6 +2068,7 @@ func (a *App) applyOnlineMetadata(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	seenBooks := map[int64]bool{}
+	appliedBookIDs := []int64{}
 	tx, err := a.db.BeginTx(r.Context(), nil)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1832,6 +2087,7 @@ func (a *App) applyOnlineMetadata(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		seenBooks[candidate.BookID] = true
+		appliedBookIDs = append(appliedBookIDs, candidate.BookID)
 		if _, err := tx.ExecContext(r.Context(), `UPDATE books SET title = CASE WHEN ? != '' THEN ? ELSE title END, author = CASE WHEN ? != '' THEN ? ELSE author END WHERE id = ?`, candidate.Title, candidate.Title, candidate.Author, candidate.Author, candidate.BookID); err != nil {
 			_ = tx.Rollback()
 			http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1851,6 +2107,12 @@ func (a *App) applyOnlineMetadata(w http.ResponseWriter, r *http.Request) {
 	if err := tx.Commit(); err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
+	}
+	for _, bookID := range appliedBookIDs {
+		if err := consolidateBookMetadata(r.Context(), bookID, a.db, a.bookshelf); err != nil {
+			http.Error(w, "metadata applied but could not be copied into the book file: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	writeJSON(w, map[string]int{"applied": len(seenBooks)})
 }

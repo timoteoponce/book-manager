@@ -18,6 +18,8 @@ Implemented:
 - EPUB covers and locally extracted EPUB/PDF metadata.
 - PDF metadata decoding including escaped UTF-16 and octal strings.
 - Editable tags, notes, and reading status.
+- Metadata consolidation into supported EPUB and PDF files using atomic replacement.
+- Single-book and bulk deletion through recoverable `.book-manager/trash/` moves.
 - JSON catalogue export.
 - Optional Open Library metadata lookup with per-book candidate selection.
 - Human-readable organization preview and collision-safe moves:
@@ -41,6 +43,7 @@ Implemented:
 - Cleanup does not permanently delete book files; selected files move to recoverable trash.
 - The SQLite catalogue can be rebuilt by scanning the bookshelf again.
 - The application binds to localhost only.
+- Embedded metadata writes that cannot be completed safely are reported instead of replacing the original file.
 
 ## Run From Source
 
