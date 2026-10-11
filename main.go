@@ -256,6 +256,7 @@ func main() {
 	mux.HandleFunc("/api/sync/status", app.syncStatus)
 	mux.HandleFunc("/api/heartbeat", app.heartbeat)
 	mux.HandleFunc("/api/open/", app.open)
+	mux.HandleFunc("/api/reveal/", app.reveal)
 	mux.HandleFunc("/api/preview/", app.preview)
 	mux.HandleFunc("/api/cover/", app.cover)
 	mux.HandleFunc("/api/cleanup/candidates", app.cleanupCandidatesHandler)
@@ -1443,6 +1444,37 @@ func (a *App) open(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]string{"status": "opened"})
 }
 
+func (a *App) reveal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	id, err := bookID(r.URL.Path, "/api/reveal/")
+	if err != nil {
+		http.Error(w, "invalid book id", http.StatusBadRequest)
+		return
+	}
+	var relative string
+	if err := a.db.QueryRowContext(r.Context(), `SELECT path FROM books WHERE id = ?`, id).Scan(&relative); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+		} else {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+		}
+		return
+	}
+	path := filepath.Join(a.bookshelf, filepath.FromSlash(relative))
+	if _, err := os.Stat(path); err != nil {
+		http.Error(w, "book is no longer at its indexed path; sync first", http.StatusNotFound)
+		return
+	}
+	if err := revealInFileManager(path); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, map[string]string{"status": "revealed"})
+}
+
 func bookID(path, prefix string) (int64, error) {
 	value := strings.TrimPrefix(path, prefix)
 	var id int64
@@ -2405,6 +2437,20 @@ func openWithOS(path string) error {
 		command = exec.Command("cmd", "/c", "start", "", path)
 	default:
 		command = exec.Command("xdg-open", path)
+	}
+	return command.Start()
+}
+
+func revealInFileManager(path string) error {
+	var command *exec.Cmd
+	switch runtime.GOOS {
+	case "darwin":
+		command = exec.Command("open", "-R", path)
+	case "windows":
+		command = exec.Command("explorer", "/select,"+path)
+	default:
+		// Most Linux file managers cannot preselect a file, so open its folder.
+		command = exec.Command("xdg-open", filepath.Dir(path))
 	}
 	return command.Start()
 }

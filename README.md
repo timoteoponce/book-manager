@@ -22,6 +22,8 @@ Implemented:
 - Editable tags, notes, and reading status.
 - Metadata consolidation into supported EPUB and PDF files using atomic replacement.
 - Single-book and bulk deletion through recoverable `.book-manager/trash/` moves.
+- Icon-based card actions with tooltips, including open, show in folder, details, and delete.
+- Show-in-folder support for macOS (Finder), Windows (Explorer), and Linux (parent folder).
 - JSON catalogue export.
 - Optional Open Library metadata lookup with per-book candidate selection.
 - Human-readable organization preview and collision-safe moves:
