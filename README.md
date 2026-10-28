@@ -95,7 +95,7 @@ BookManager/
     catalog.sqlite
 ```
 
-The binary selects an available localhost port and opens the default browser. The browser opens before a large initial sync finishes and displays progress while the catalogue is built. When the browser tab is closed, the binary exits after a short heartbeat timeout.
+The binary selects an available localhost port and opens the default browser. The browser opens before a large initial sync finishes and displays progress while the catalogue is built. The binary keeps running until you stop it (Ctrl+C or by closing its terminal).
 
 Build the current Linux binary:
 

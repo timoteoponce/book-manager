@@ -198,9 +198,9 @@ cp -r "~/bookshelf/Manga & Comics/My Hero Academia Vigilantes" /tmp/mha/
 book-manager -no-browser -bookshelf /tmp/mha -db /tmp/mha.sqlite -addr 127.0.0.1:8799
 ```
 
-Because the app exits when the browser heartbeat stops, background servers started
-from a tool call are killed when the call returns. Start, query, and kill within a
-**single** shell invocation, and always `kill` at the end.
+Background servers started from a tool call are killed when the call returns.
+Start, query, and kill within a **single** shell invocation, and always `kill` at
+the end.
 
 ## Testing conventions
 
@@ -225,7 +225,6 @@ from a tool call are killed when the call returns. Start, query, and kill within
 | POST | `/api/books/delete` | Move books to trash (JSON `{ids:[...]}`) |
 | POST | `/api/sync` | Start a background scan (202, or 409 if running) |
 | GET | `/api/sync/status` | `syncing`, `result`, `error` |
-| POST | `/api/heartbeat` | Keeps the portable process alive; 204 |
 | POST | `/api/open/{id}` | Open with the OS default reader |
 | POST | `/api/reveal/{id}` | Show in Finder / Explorer / parent folder |
 | GET | `/api/cover/{id}` | EPUB cover image bytes |

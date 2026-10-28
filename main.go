@@ -60,7 +60,6 @@ type App struct {
 	syncing           bool
 	lastSync          SyncResult
 	lastSyncErr       string
-	lastHeartbeat     time.Time
 	metadataRunning   bool
 	metadataOperation string
 	metadataCurrent   int
@@ -270,7 +269,6 @@ func main() {
 	mux.HandleFunc("/api/organize/undo", app.organizationUndo)
 	mux.HandleFunc("/api/sync", app.syncHandler)
 	mux.HandleFunc("/api/sync/status", app.syncStatus)
-	mux.HandleFunc("/api/heartbeat", app.heartbeat)
 	mux.HandleFunc("/api/open/", app.open)
 	mux.HandleFunc("/api/reveal/", app.reveal)
 	mux.HandleFunc("/api/preview/", app.preview)
@@ -292,17 +290,11 @@ func main() {
 	}
 	applicationURL := "http://" + listener.Addr().String()
 	log.Printf("open %s", applicationURL)
-	browserOpened := false
 	if !*noBrowser {
 		if err := openBrowser(applicationURL); err != nil {
 			log.Printf("could not open browser: %v", err)
-		} else {
-			browserOpened = true
 		}
 	}
-	app.stateMu.Lock()
-	app.lastHeartbeat = time.Now()
-	app.stateMu.Unlock()
 	app.setSyncing(true)
 	go func() {
 		if _, err := app.syncInBackground(context.Background()); err != nil {
@@ -310,9 +302,6 @@ func main() {
 		}
 	}()
 	server := &http.Server{Handler: mux}
-	if browserOpened {
-		go app.monitorBrowser(server)
-	}
 	if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 		log.Fatal(err)
 	}
@@ -602,17 +591,6 @@ func (a *App) syncStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, response)
 }
 
-func (a *App) heartbeat(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-	a.stateMu.Lock()
-	a.lastHeartbeat = time.Now()
-	a.stateMu.Unlock()
-	w.WriteHeader(http.StatusNoContent)
-}
-
 func (a *App) startMetadataJob(operation string) bool {
 	a.stateMu.Lock()
 	defer a.stateMu.Unlock()
@@ -669,24 +647,6 @@ func (a *App) metadataStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	a.stateMu.RUnlock()
 	writeJSON(w, response)
-}
-
-func (a *App) monitorBrowser(server *http.Server) {
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for now := range ticker.C {
-		a.stateMu.RLock()
-		lastHeartbeat := a.lastHeartbeat
-		a.stateMu.RUnlock()
-		if now.Sub(lastHeartbeat) < 20*time.Second {
-			continue
-		}
-		log.Printf("browser heartbeat stopped; shutting down")
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = server.Shutdown(ctx)
-		cancel()
-		return
-	}
 }
 
 func (a *App) cleanupCandidatesHandler(w http.ResponseWriter, r *http.Request) {

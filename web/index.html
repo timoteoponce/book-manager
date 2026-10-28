@@ -97,7 +97,6 @@
     async function restoreTrashRun(runId) { if (!(await ask('Restore these files to their original locations?'))) return; const response = await fetch('/api/trash/restore', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({runId})}); if (!response.ok) { notify(await response.text(), 'error'); return; } const result = await response.json(); notify(`Restored ${result.restored} files.`); document.querySelector('#trash-dialog').close(); await showTrash(); await load(); }
     async function deleteTrashRun(runId) { if (!(await ask('Permanently delete this run? This cannot be undone.'))) return; const response = await fetch('/api/trash/delete', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({runId})}); if (!response.ok) { notify(await response.text(), 'error'); return; } notify('Run permanently deleted.'); await showTrash(); }
     async function emptyTrash() { if (!(await ask('Permanently delete every run in the trash? This cannot be undone.'))) return; const runs = [...document.querySelectorAll('.trash-run')].map(node => node.dataset.run); for (const runId of runs) { const response = await fetch('/api/trash/delete', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({runId})}); if (!response.ok) { notify(await response.text(), 'error'); break; } } notify('Trash emptied.'); await showTrash(); }
-    function heartbeat() { fetch('/api/heartbeat', {method: 'POST', keepalive: true}).catch(() => {}); }
     let timer; search.addEventListener('input', () => { clearTimeout(timer); timer = setTimeout(load, 150); }); format.addEventListener('change', load); status.addEventListener('change', load);
     document.querySelector('#organize').addEventListener('click', showOrganization);
     document.querySelector('#cleanup').addEventListener('click', showCleanup);
@@ -107,7 +106,7 @@
     document.querySelector('#review-online').addEventListener('click', showOnlineCandidates);
     document.querySelector('#delete-books').addEventListener('click', deleteSelectedBooks);
     sync.addEventListener('click', async () => { sync.disabled = true; sync.textContent = 'Syncing...'; try { const response = await fetch('/api/sync', {method: 'POST'}); if (!response.ok) throw new Error(await response.text()); await load(); } catch (error) { summary.textContent = `Sync failed: ${error.message}`; } finally { sync.disabled = false; sync.textContent = 'Sync bookshelf'; } });
-    heartbeat(); setInterval(heartbeat, 5000); window.addEventListener('pagehide', () => navigator.sendBeacon('/api/heartbeat', '')); load(); pollMetadataStatus(); setInterval(pollSyncStatus, 2000); setInterval(pollMetadataStatus, 1000);
+    load(); pollMetadataStatus(); setInterval(pollSyncStatus, 2000); setInterval(pollMetadataStatus, 1000);
   </script>
 </body>
 </html>
