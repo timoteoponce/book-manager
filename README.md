@@ -22,10 +22,10 @@ Implemented:
 - SHA-256 file fingerprints for rename detection and exact duplicate detection.
 - Non-destructive sync that preserves unavailable records and user metadata.
 - Search by title, author, folder, filename, tags, format, and reading status.
-- EPUB covers and locally extracted EPUB/PDF metadata.
+- EPUB and PDF covers plus locally extracted EPUB/PDF metadata.
 - Series and series index from EPUB metadata (Calibre and EPUB 3 collections) with filename/folder fallback.
 - Rejection of placeholder titles such as `0 (2)` in favour of the filename-derived title.
-- PDF metadata decoding including escaped UTF-16 and octal strings.
+- PDF metadata read from the document Info dictionary, ignoring outline/bookmark titles and handling encrypted files.
 - Editable tags, notes, and reading status.
 - Metadata consolidation into supported EPUB and PDF files using atomic replacement.
 - Single-book and bulk deletion through recoverable `.book-manager/trash/` moves.
@@ -131,8 +131,8 @@ Always pass the tool version to `mise exec` (`mise exec go@1.24 -- ...`); a bare
 `mise exec` fails on this machine because the global mise config pins an
 unavailable Java version. See [`AGENTS.md`](AGENTS.md) for the full toolchain notes.
 
-The test suite covers sync preservation, rename detection, cache reuse, EPUB covers,
-series, PDF metadata decoding, organization moves and undo, cleanup, app-data
+The test suite covers sync preservation, rename detection, cache reuse, EPUB and PDF
+covers, series, PDF metadata parsing, organization moves and undo, cleanup, app-data
 directory exclusion, and trash restore and purge.
 
 ## Roadmap

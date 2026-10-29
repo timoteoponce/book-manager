@@ -5,8 +5,12 @@ import (
 	"bytes"
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
+	"image"
+	"image/color"
+	"image/jpeg"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +18,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	pdfapi "github.com/pdfcpu/pdfcpu/pkg/api"
+	pdfmodel "github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 	_ "modernc.org/sqlite"
 )
 
@@ -105,6 +111,44 @@ func TestSyncReusesUnchangedFileCache(t *testing.T) {
 	}
 	if title != "Cached Metadata" || author != "Cached Author" || fingerprint != "cached:fingerprint" {
 		t.Fatalf("cached metadata = %q, %q, %q", title, author, fingerprint)
+	}
+}
+
+func TestSyncRefreshesStalePDFMetadata(t *testing.T) {
+	bookshelf := t.TempDir()
+	source := writeTestPDF(t, "<< /Title (Correct PDF Title) /Author (Jane Doe) >>")
+	data, err := os.ReadFile(source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bookshelf, "book.pdf"), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	db, err := sql.Open("sqlite", "file:pdf-metadata-version-test?mode=memory&cache=shared")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(1)
+	app := &App{db: db, bookshelf: bookshelf}
+	if err := app.initDB(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE books SET title = 'Cover', author = 'Wrong', metadata_version = 0`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.sync(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	var title, author string
+	if err := db.QueryRow(`SELECT title, author FROM books`).Scan(&title, &author); err != nil {
+		t.Fatal(err)
+	}
+	if title != "Correct PDF Title" || author != "Jane Doe" {
+		t.Fatalf("metadata = %q, %q", title, author)
 	}
 }
 
@@ -272,6 +316,38 @@ func TestSearchMatchesSeriesMetadata(t *testing.T) {
 	}
 }
 
+func writeTestPDF(t *testing.T, info string) string {
+	t.Helper()
+	return writeTestPDFObjects(t, []string{
+		"<< /Type /Catalog /Pages 2 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+		info,
+	}, 1, 4)
+}
+
+func writeTestPDFObjects(t *testing.T, objects []string, root, info int) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "book.pdf")
+	var buffer bytes.Buffer
+	buffer.WriteString("%PDF-1.4\n")
+	offsets := make([]int, len(objects)+1)
+	for index, body := range objects {
+		offsets[index+1] = buffer.Len()
+		fmt.Fprintf(&buffer, "%d 0 obj\n%s\nendobj\n", index+1, body)
+	}
+	xref := buffer.Len()
+	fmt.Fprintf(&buffer, "xref\n0 %d\n0000000000 65535 f \n", len(objects)+1)
+	for index := 1; index <= len(objects); index++ {
+		fmt.Fprintf(&buffer, "%010d 00000 n \n", offsets[index])
+	}
+	fmt.Fprintf(&buffer, "trailer\n<< /Size %d /Root %d 0 R /Info %d 0 R >>\nstartxref\n%d\n%%%%EOF\n", len(objects)+1, root, info, xref)
+	if err := os.WriteFile(path, buffer.Bytes(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
 func writeTestEPUB(t *testing.T, opf string) string {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "book.epub")
@@ -303,26 +379,71 @@ func writeTestEPUB(t *testing.T, opf string) string {
 }
 
 func TestPDFMetadataReadsInfoDictionary(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "book.pdf")
-	if err := os.WriteFile(path, []byte("7 0 obj << /Title (A PDF Title) /Author (Jane Doe) >> endobj"), 0o644); err != nil {
-		t.Fatal(err)
-	}
+	path := writeTestPDF(t, "<< /Title (A PDF Title) /Author (Jane Doe) >>")
 	title, author := pdfMetadata(path)
 	if title != "A PDF Title" || author != "Jane Doe" {
 		t.Fatalf("metadata = %q, %q", title, author)
 	}
 }
 
-func TestPDFMetadataDecodesEscapedUTF16Title(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "utf16-title.pdf")
-	encodedTitle := `\376\377\000W\000h\000a\000t\000\040\000y\000o\000u\000\040\000n\000e\000e\000d\000\040\000t\000o\000\040\000k\000n\000o\000w\000\040\000a\000b\000o\000u\000t\000\040\000d\000a\000t\000e\000s\000\040\000a\000n\000d\000\040\000t\000i\000m\000e\000s\000\040\000i\000n\000\040\000c\000o\000m\000p\000u\000t\000i\000n\000g`
-	if err := os.WriteFile(path, []byte("7 0 obj << /Title ("+encodedTitle+") >> endobj"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	title, _ := pdfMetadata(path)
+func TestPDFMetadataDecodesUTF16Title(t *testing.T) {
 	expected := "What you need to know about dates and times in computing"
+	var encoded []byte
+	encoded = append(encoded, 0xFE, 0xFF)
+	for _, character := range expected {
+		encoded = binary.BigEndian.AppendUint16(encoded, uint16(character))
+	}
+	path := writeTestPDF(t, fmt.Sprintf("<< /Title <%X> >>", encoded))
+	title, _ := pdfMetadata(path)
 	if title != expected {
 		t.Fatalf("decoded title = %q, want %q", title, expected)
+	}
+}
+
+func TestPDFCoverExtractsFirstPageImage(t *testing.T) {
+	directory := t.TempDir()
+	imagePath := filepath.Join(directory, "cover.jpg")
+	imageFile, err := os.Create(imagePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	picture := image.NewRGBA(image.Rect(0, 0, 8, 8))
+	for y := 0; y < 8; y++ {
+		for x := 0; x < 8; x++ {
+			picture.Set(x, y, color.RGBA{R: 200, G: 80, B: 40, A: 255})
+		}
+	}
+	if err := jpeg.Encode(imageFile, picture, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := imageFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+	pdfPath := filepath.Join(directory, "book.pdf")
+	if err := pdfapi.ImportImagesFile([]string{imagePath}, pdfPath, nil, pdfmodel.NewDefaultConfiguration()); err != nil {
+		t.Fatal(err)
+	}
+	cover, err := embeddedPDFCover(pdfPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(cover, []byte{0xFF, 0xD8}) {
+		t.Fatalf("cover is not a JPEG: %X", cover[:min(len(cover), 8)])
+	}
+}
+
+func TestPDFMetadataIgnoresBookmarkTitles(t *testing.T) {
+	path := writeTestPDFObjects(t, []string{
+		"<< /Type /Catalog /Pages 2 0 R /Outlines 5 0 R >>",
+		"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+		"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 100 100] >>",
+		"<< /Title (Correct Title) /Author (Jane Doe) >>",
+		"<< /Type /Outlines /First 6 0 R /Last 6 0 R /Count 1 >>",
+		"<< /Title (Garbled Bookmark) /Parent 5 0 R >>",
+	}, 1, 4)
+	title, author := pdfMetadata(path)
+	if title != "Correct Title" || author != "Jane Doe" {
+		t.Fatalf("metadata = %q, %q", title, author)
 	}
 }
 

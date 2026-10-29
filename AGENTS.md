@@ -54,8 +54,9 @@ dynamically linked build that will not run on other machines.
 
 2. **`github.com/pdfcpu/pdfcpu` must stay at `v0.11.1`.** v0.12.0 and newer require
    Go >= 1.25, v0.15.0+ requires 1.25, and v0.16.x requires 1.26. Bumping it forces a
-   Go upgrade and a toolchain download. pdfcpu is used only for writing PDF
-   document properties; it roughly doubles the binary size (16 MB -> 27 MB).
+   Go upgrade and a toolchain download. pdfcpu is used for reading and writing PDF
+   metadata and for extracting PDF covers; it roughly doubles the binary size
+   (16 MB -> 27 MB).
 
 3. After any dependency change run `GOTOOLCHAIN=local mise exec go@1.24 -- go mod tidy`.
    Without `GOTOOLCHAIN=local`, Go will silently rewrite `go.mod` to a newer language
@@ -84,13 +85,19 @@ progress/status fields exposed by `/api/sync/status` and `/api/metadata/status`.
 
 ### Metadata extraction
 
-`extractMetadata(path, format)` handles `epub` (full OPF parse) and `pdf` (regex over
-the Info dictionary). Other formats return empty, and callers fall back to
+`extractMetadata(path, format)` handles `epub` (full OPF parse) and `pdf` (pdfcpu
+Info dictionary read). Other formats return empty, and callers fall back to
 filename-derived values.
 
-PDF metadata strings are escaped and often UTF-16BE with a `FEFF` BOM. `decodePDFString`
-handles octal escapes, `\n`/`\r`/`\t`, and both UTF-16 byte orders. A naive
-unescape produces garbage like `\376\377\000W\000h...` in the UI.
+PDFs must be read through pdfcpu, not by scanning raw bytes for `/Title`. PDFs
+commonly contain outline entries with `/Title` values encoded for bookmarks; a
+regex picks those up and produces garbage author/title pairs. pdfcpu also handles
+object streams and empty-password encryption.
+
+`pdfMetadataVersion` on each `books` row invalidates cached PDF metadata
+when the extractor changes. On sync, outdated rows are re-read without re-hashing
+the file or rewriting it. Bump the constant whenever PDF extraction semantics
+change.
 
 Series comes from three sources, in priority order:
 
@@ -105,6 +112,11 @@ singular/plural and punctuation differences between folder and filename.
 
 `meaningfulTitle` rejects placeholder titles such as `0 (2)` that comics archives
 commonly contain, falling back to the filename.
+
+PDF covers are rendered from page 1 with QuickLook on macOS or `pdftoppm`/`mutool`
+on Linux, falling back to the largest embedded first-page image through pdfcpu.
+Rendered covers are cached under `.book-manager/covers/` and regenerated when the
+book file's mtime is newer than the cache.
 
 ### Writing metadata into files
 
@@ -227,7 +239,7 @@ the end.
 | GET | `/api/sync/status` | `syncing`, `result`, `error` |
 | POST | `/api/open/{id}` | Open with the OS default reader |
 | POST | `/api/reveal/{id}` | Show in Finder / Explorer / parent folder |
-| GET | `/api/cover/{id}` | EPUB cover image bytes |
+| GET | `/api/cover/{id}` | EPUB/PDF cover image bytes |
 | GET | `/api/preview/{id}` | Inline PDF bytes (endpoint retained; UI no longer embeds it) |
 | GET | `/api/export` | JSON catalogue download |
 | POST | `/api/metadata/refresh` | Start local metadata refresh (202) |

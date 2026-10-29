@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"embed"
-	"encoding/binary"
 	"encoding/json"
 	"encoding/xml"
 	"errors"
@@ -30,7 +29,6 @@ import (
 	"sync"
 	"time"
 	"unicode"
-	"unicode/utf16"
 
 	pdfapi "github.com/pdfcpu/pdfcpu/pkg/api"
 	pdfmodel "github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
@@ -42,6 +40,8 @@ import (
 var webFS embed.FS
 
 const appDataDirName = ".book-manager"
+
+const pdfMetadataVersion = 1
 
 func trashRoot() string {
 	return filepath.Join(appDataDirName, "trash")
@@ -326,7 +326,8 @@ func (a *App) initDB(ctx context.Context) error {
 			notes TEXT NOT NULL DEFAULT '',
 			last_synced_at TEXT NOT NULL,
 			fingerprint TEXT NOT NULL DEFAULT '',
-			available INTEGER NOT NULL DEFAULT 1
+			available INTEGER NOT NULL DEFAULT 1,
+			metadata_version INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS books_title_idx ON books(title COLLATE NOCASE);
 		CREATE INDEX IF NOT EXISTS books_folder_idx ON books(folder COLLATE NOCASE);
@@ -403,8 +404,9 @@ func (a *App) initDB(ctx context.Context) error {
 	}
 	// These columns make upgrades safe for catalogues created by earlier builds.
 	for name, definition := range map[string]string{
-		"fingerprint": "TEXT NOT NULL DEFAULT ''",
-		"available":   "INTEGER NOT NULL DEFAULT 1",
+		"fingerprint":      "TEXT NOT NULL DEFAULT ''",
+		"available":        "INTEGER NOT NULL DEFAULT 1",
+		"metadata_version": "INTEGER NOT NULL DEFAULT 0",
 	} {
 		var found int
 		err := a.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM pragma_table_info('books') WHERE name = ?`, name).Scan(&found)
@@ -441,7 +443,7 @@ func (a *App) syncInBackground(ctx context.Context) (SyncResult, error) {
 func (a *App) syncUnlocked(ctx context.Context) (SyncResult, error) {
 	type foundBook struct {
 		path, folder, filename, title, author, format, modified, fingerprint string
-		size                                                                 int64
+		size, metadataVersion                                                int64
 	}
 	var found []foundBook
 	err := filepath.WalkDir(a.bookshelf, func(path string, entry fs.DirEntry, err error) error {
@@ -470,16 +472,24 @@ func (a *App) syncUnlocked(ctx context.Context) (SyncResult, error) {
 		}
 		modified := info.ModTime().UTC().Format(time.RFC3339Nano)
 		var cachedTitle, cachedAuthor, cachedFingerprint, cachedModified string
-		var cachedSize int64
-		cacheErr := a.db.QueryRowContext(ctx, `SELECT title, author, fingerprint, size, modified_at FROM books WHERE path = ?`, filepath.ToSlash(rel)).Scan(&cachedTitle, &cachedAuthor, &cachedFingerprint, &cachedSize, &cachedModified)
+		var cachedSize, cachedMetadataVersion int64
+		cacheErr := a.db.QueryRowContext(ctx, `SELECT title, author, fingerprint, size, modified_at, metadata_version FROM books WHERE path = ?`, filepath.ToSlash(rel)).Scan(&cachedTitle, &cachedAuthor, &cachedFingerprint, &cachedSize, &cachedModified, &cachedMetadataVersion)
 		title, author := displayMetadata(entry.Name())
 		fingerprint := ""
-		if cacheErr == nil && cachedFingerprint != "" && cachedSize == info.Size() && cachedModified == modified && metadataCacheUsable(cachedTitle, cachedAuthor) {
-			title, author, fingerprint = cachedTitle, cachedAuthor, cachedFingerprint
+		metadataVersion := int64(pdfMetadataVersion)
+		identityMatch := cacheErr == nil && cachedFingerprint != "" && cachedSize == info.Size() && cachedModified == modified
+		cacheUsable := identityMatch && metadataCacheUsable(cachedTitle, cachedAuthor)
+		stalePDFMetadata := identityMatch && ext == ".pdf" && cachedMetadataVersion < pdfMetadataVersion
+		if cacheUsable && !stalePDFMetadata {
+			title, author, fingerprint, metadataVersion = cachedTitle, cachedAuthor, cachedFingerprint, cachedMetadataVersion
 		} else {
-			fingerprint, err = fileFingerprint(path)
-			if err != nil {
-				return err
+			if identityMatch {
+				fingerprint = cachedFingerprint
+			} else {
+				fingerprint, err = fileFingerprint(path)
+				if err != nil {
+					return err
+				}
 			}
 			if ext == ".epub" {
 				if epubTitle, epubAuthor := epubMetadata(path); epubTitle != "" {
@@ -495,14 +505,16 @@ func (a *App) syncUnlocked(ctx context.Context) (SyncResult, error) {
 					}
 				}
 			}
-			if err := consolidateMetadata(path, strings.TrimPrefix(ext, "."), extractedMetadata{Title: title, Author: author}); err != nil {
-				log.Printf("metadata consolidation skipped for %s: %v", path, err)
+			if !identityMatch {
+				if err := consolidateMetadata(path, strings.TrimPrefix(ext, "."), extractedMetadata{Title: title, Author: author}); err != nil {
+					log.Printf("metadata consolidation skipped for %s: %v", path, err)
+				}
 			}
 		}
 		found = append(found, foundBook{
 			path: filepath.ToSlash(rel), folder: filepath.ToSlash(filepath.Dir(rel)),
 			filename: entry.Name(), title: title, author: author, format: strings.TrimPrefix(ext, "."),
-			size: info.Size(), modified: modified, fingerprint: fingerprint,
+			size: info.Size(), modified: modified, fingerprint: fingerprint, metadataVersion: metadataVersion,
 		})
 		return nil
 	})
@@ -527,15 +539,15 @@ func (a *App) syncUnlocked(ctx context.Context) (SyncResult, error) {
 		if errors.Is(pathErr, sql.ErrNoRows) {
 			pathErr = tx.QueryRowContext(ctx, `SELECT id FROM books WHERE fingerprint = ? AND available = 0 LIMIT 1`, book.fingerprint).Scan(&id)
 			if pathErr == nil {
-				_, err = tx.ExecContext(ctx, `UPDATE books SET path=?, folder=?, filename=?, title=?, author=?, format=?, size=?, modified_at=?, last_synced_at=?, fingerprint=?, available=1 WHERE id=?`, book.path, book.folder, book.filename, book.title, book.author, book.format, book.size, book.modified, now, book.fingerprint, id)
+				_, err = tx.ExecContext(ctx, `UPDATE books SET path=?, folder=?, filename=?, title=?, author=?, format=?, size=?, modified_at=?, last_synced_at=?, fingerprint=?, available=1, metadata_version=? WHERE id=?`, book.path, book.folder, book.filename, book.title, book.author, book.format, book.size, book.modified, now, book.fingerprint, book.metadataVersion, id)
 				result.Renamed++
 			} else if errors.Is(pathErr, sql.ErrNoRows) {
-				_, err = tx.ExecContext(ctx, `INSERT INTO books (path, folder, filename, title, author, format, size, modified_at, last_synced_at, fingerprint, available) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)`, book.path, book.folder, book.filename, book.title, book.author, book.format, book.size, book.modified, now, book.fingerprint)
+				_, err = tx.ExecContext(ctx, `INSERT INTO books (path, folder, filename, title, author, format, size, modified_at, last_synced_at, fingerprint, available, metadata_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`, book.path, book.folder, book.filename, book.title, book.author, book.format, book.size, book.modified, now, book.fingerprint, book.metadataVersion)
 			} else {
 				err = pathErr
 			}
 		} else if pathErr == nil {
-			_, err = tx.ExecContext(ctx, `UPDATE books SET folder=?, filename=?, title=?, author=?, format=?, size=?, modified_at=?, last_synced_at=?, fingerprint=?, available=1 WHERE id=?`, book.folder, book.filename, book.title, book.author, book.format, book.size, book.modified, now, book.fingerprint, id)
+			_, err = tx.ExecContext(ctx, `UPDATE books SET folder=?, filename=?, title=?, author=?, format=?, size=?, modified_at=?, last_synced_at=?, fingerprint=?, available=1, metadata_version=? WHERE id=?`, book.folder, book.filename, book.title, book.author, book.format, book.size, book.modified, now, book.fingerprint, book.metadataVersion, id)
 		} else {
 			err = pathErr
 		}
@@ -1530,21 +1542,161 @@ func (a *App) cover(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if format != "epub" {
+	path := filepath.Join(a.bookshelf, filepath.FromSlash(relative))
+	switch format {
+	case "epub":
+		cover, mediaType, err := epubCover(path)
+		if err != nil {
+			http.NotFound(w, r)
+			return
+		}
+		defer cover.Close()
+		w.Header().Set("Content-Type", mediaType)
+		w.Header().Set("Cache-Control", "private, max-age=3600")
+		if _, err := io.Copy(w, cover); err != nil {
+			log.Printf("cover response failed: %v", err)
+		}
+	case "pdf":
+		a.pdfCover(w, r, path, id)
+	default:
 		http.NotFound(w, r)
-		return
 	}
-	cover, mediaType, err := epubCover(filepath.Join(a.bookshelf, filepath.FromSlash(relative)))
+}
+
+func (a *App) pdfCover(w http.ResponseWriter, r *http.Request, path string, id int64) {
+	bookInfo, err := os.Stat(path)
 	if err != nil {
 		http.NotFound(w, r)
 		return
 	}
-	defer cover.Close()
-	w.Header().Set("Content-Type", mediaType)
+	cachePath := filepath.Join(a.bookshelf, appDataDirName, "covers", fmt.Sprintf("pdf-%d", id))
+	if info, err := os.Stat(cachePath); err == nil && !info.ModTime().Before(bookInfo.ModTime()) {
+		if data, err := os.ReadFile(cachePath); err == nil {
+			writeCover(w, data)
+			return
+		}
+	}
+	data, err := pdfCoverImage(r.Context(), path)
+	if err != nil {
+		log.Printf("pdf cover for %s: %v", filepath.Base(path), err)
+		http.NotFound(w, r)
+		return
+	}
+	if err := os.MkdirAll(filepath.Dir(cachePath), 0o755); err == nil {
+		if err := atomicRewrite(cachePath, func(tempPath string) error {
+			return os.WriteFile(tempPath, data, 0o644)
+		}); err != nil {
+			log.Printf("cover cache write failed: %v", err)
+		}
+	}
+	writeCover(w, data)
+}
+
+func writeCover(w http.ResponseWriter, data []byte) {
+	w.Header().Set("Content-Type", http.DetectContentType(data))
 	w.Header().Set("Cache-Control", "private, max-age=3600")
-	if _, err := io.Copy(w, cover); err != nil {
+	if _, err := w.Write(data); err != nil {
 		log.Printf("cover response failed: %v", err)
 	}
+}
+
+func pdfCoverImage(ctx context.Context, path string) ([]byte, error) {
+	renderCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+	if data, err := renderPDFPage(renderCtx, path); err == nil && len(data) > 0 {
+		return data, nil
+	}
+	return embeddedPDFCover(path)
+}
+
+func renderPDFPage(ctx context.Context, path string) ([]byte, error) {
+	if runtime.GOOS == "darwin" {
+		return renderPDFPageWithQuickLook(ctx, path)
+	}
+	return renderPDFPageWithPoppler(ctx, path)
+}
+
+func renderPDFPageWithQuickLook(ctx context.Context, path string) ([]byte, error) {
+	directory, err := os.MkdirTemp("", "book-manager-cover-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(directory)
+	command := exec.CommandContext(ctx, "qlmanage", "-t", "-s", "600", "-o", directory, path)
+	if output, err := command.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("qlmanage: %w: %s", err, strings.TrimSpace(string(output)))
+	}
+	return readCoverImage(directory)
+}
+
+func renderPDFPageWithPoppler(ctx context.Context, path string) ([]byte, error) {
+	directory, err := os.MkdirTemp("", "book-manager-cover-*")
+	if err != nil {
+		return nil, err
+	}
+	defer os.RemoveAll(directory)
+	output := filepath.Join(directory, "cover")
+	if _, err := exec.LookPath("pdftoppm"); err == nil {
+		command := exec.CommandContext(ctx, "pdftoppm", "-f", "1", "-l", "1", "-singlefile", "-scale-to", "600", "-png", path, output)
+		if err := command.Run(); err != nil {
+			return nil, fmt.Errorf("pdftoppm: %w", err)
+		}
+		return readCoverImage(directory)
+	}
+	if _, err := exec.LookPath("mutool"); err == nil {
+		command := exec.CommandContext(ctx, "mutool", "draw", "-q", "-p", "1", "-w", "600", "-o", output+".png", path)
+		if err := command.Run(); err != nil {
+			return nil, fmt.Errorf("mutool: %w", err)
+		}
+		return readCoverImage(directory)
+	}
+	return nil, errors.New("no PDF renderer available")
+}
+
+func readCoverImage(directory string) ([]byte, error) {
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return nil, err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		data, err := os.ReadFile(filepath.Join(directory, entry.Name()))
+		if err != nil {
+			continue
+		}
+		if strings.HasPrefix(http.DetectContentType(data), "image/") {
+			return data, nil
+		}
+	}
+	return nil, errors.New("renderer produced no image")
+}
+
+func embeddedPDFCover(path string) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	var cover []byte
+	err = pdfapi.ExtractImages(file, []string{"1"}, func(image pdfmodel.Image, _ bool, _ int) error {
+		var buffer bytes.Buffer
+		if _, err := io.Copy(&buffer, image.Reader); err != nil {
+			return nil
+		}
+		if buffer.Len() > len(cover) {
+			cover = append([]byte(nil), buffer.Bytes()...)
+		}
+		return nil
+	}, pdfmodel.NewDefaultConfiguration())
+	if err != nil {
+		return nil, err
+	}
+	if len(cover) == 0 {
+		return nil, errors.New("no images on first page")
+	}
+	return cover, nil
 }
 
 func (a *App) open(w http.ResponseWriter, r *http.Request) {
@@ -1700,75 +1852,32 @@ func sanitizePathPart(value string) string {
 	return value
 }
 
-var pdfInfoString = regexp.MustCompile(`/((?:Title)|(?:Author))\s*\(([^()]*)\)`)
-
 func pdfMetadata(path string) (string, string) {
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
 	if err != nil {
 		return "", ""
 	}
-	var title, author string
-	for _, match := range pdfInfoString.FindAllStringSubmatch(string(data), -1) {
-		value := decodePDFString(match[2])
-		switch match[1] {
-		case "Title":
-			title = value
-		case "Author":
-			author = value
+	defer file.Close()
+	ctx, err := pdfapi.ReadContext(file, pdfmodel.NewDefaultConfiguration())
+	if err != nil || ctx.Info == nil {
+		return "", ""
+	}
+	info, err := ctx.DereferenceDict(*ctx.Info)
+	if err != nil || info == nil {
+		return "", ""
+	}
+	lookup := func(key string) string {
+		object, ok := info[key]
+		if !ok {
+			return ""
 		}
-	}
-	return title, author
-}
-
-func decodePDFString(value string) string {
-	decoded := make([]byte, 0, len(value))
-	for index := 0; index < len(value); index++ {
-		if value[index] != '\\' || index+1 >= len(value) {
-			decoded = append(decoded, value[index])
-			continue
+		value, err := ctx.DereferenceStringOrHexLiteral(object, pdfmodel.V10, nil)
+		if err != nil {
+			return ""
 		}
-		index++
-		switch value[index] {
-		case 'n':
-			decoded = append(decoded, '\n')
-		case 'r':
-			decoded = append(decoded, '\r')
-		case 't':
-			decoded = append(decoded, '\t')
-		case 'b':
-			decoded = append(decoded, '\b')
-		case 'f':
-			decoded = append(decoded, '\f')
-		case '(', ')', '\\':
-			decoded = append(decoded, value[index])
-		default:
-			if value[index] < '0' || value[index] > '7' {
-				decoded = append(decoded, value[index])
-				continue
-			}
-			octal := int(value[index] - '0')
-			for digits := 1; digits < 3 && index+1 < len(value) && value[index+1] >= '0' && value[index+1] <= '7'; digits++ {
-				index++
-				octal = octal*8 + int(value[index]-'0')
-			}
-			decoded = append(decoded, byte(octal))
-		}
+		return strings.TrimSpace(value)
 	}
-	if bytes.HasPrefix(decoded, []byte{0xfe, 0xff}) {
-		return strings.TrimSpace(decodeUTF16(decoded[2:], binary.BigEndian))
-	}
-	if bytes.HasPrefix(decoded, []byte{0xff, 0xfe}) {
-		return strings.TrimSpace(decodeUTF16(decoded[2:], binary.LittleEndian))
-	}
-	return strings.TrimSpace(string(decoded))
-}
-
-func decodeUTF16(data []byte, order binary.ByteOrder) string {
-	units := make([]uint16, 0, len(data)/2)
-	for index := 0; index+1 < len(data); index += 2 {
-		units = append(units, order.Uint16(data[index:index+2]))
-	}
-	return string(utf16.Decode(units))
+	return lookup("Title"), lookup("Author")
 }
 
 func epubMetadata(path string) (string, string) {
@@ -2227,7 +2336,7 @@ func (a *App) refreshMetadataJob(ctx context.Context) (int, int, error) {
 		if metadata.Series == "" {
 			metadata.Series, metadata.SeriesIndex = seriesFromFilename(fullPath)
 		}
-		if _, err = a.db.ExecContext(ctx, `UPDATE books SET title = CASE WHEN ? != '' THEN ? ELSE title END, author = CASE WHEN ? != '' THEN ? ELSE author END WHERE id = ?`, metadata.Title, metadata.Title, metadata.Author, metadata.Author, file.id); err != nil {
+		if _, err = a.db.ExecContext(ctx, `UPDATE books SET title = CASE WHEN ? != '' THEN ? ELSE title END, author = CASE WHEN ? != '' THEN ? ELSE author END, metadata_version = ? WHERE id = ?`, metadata.Title, metadata.Title, metadata.Author, metadata.Author, pdfMetadataVersion, file.id); err != nil {
 			return refreshed, failed, err
 		}
 		if _, err = a.db.ExecContext(ctx, `INSERT INTO book_metadata (book_id, publisher, published_at, isbn, language, description, series, series_index, refreshed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(book_id) DO UPDATE SET publisher=CASE WHEN excluded.publisher != '' THEN excluded.publisher ELSE book_metadata.publisher END, published_at=CASE WHEN excluded.published_at != '' THEN excluded.published_at ELSE book_metadata.published_at END, isbn=CASE WHEN excluded.isbn != '' THEN excluded.isbn ELSE book_metadata.isbn END, language=CASE WHEN excluded.language != '' THEN excluded.language ELSE book_metadata.language END, description=CASE WHEN excluded.description != '' THEN excluded.description ELSE book_metadata.description END, series=CASE WHEN excluded.series != '' THEN excluded.series ELSE book_metadata.series END, series_index=CASE WHEN excluded.series_index != '' THEN excluded.series_index ELSE book_metadata.series_index END, refreshed_at=excluded.refreshed_at`, file.id, metadata.Publisher, metadata.PublishedAt, metadata.ISBN, metadata.Language, metadata.Description, metadata.Series, metadata.SeriesIndex, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
